@@ -1,0 +1,835 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from src.context.models import OutreachContext, ProductContext, ProspectContext
+from src.db.state_store import StateStore
+from src.researcher.models import ResearchPackage, ResolutionStatus
+from src.researcher.orchestration.orchestrator import Researcher
+from src.signal_strategy.models import StrategyResult
+from src.signal_strategy.service import SignalStrategyService
+from .models import (
+    ApplicationRunSnapshot,
+    RunResult,
+    RunStatus,
+    StageExecutionRecord,
+    StageIdentifier,
+    StageStatus,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ApplicationOrchestrator:
+    """Top-level application orchestrator governing the end-to-end Zamp outreach pipeline.
+    
+    Responsibilities:
+      - Validates domain contexts and inputs.
+      - Manages persistent run lifecycle in SQLite (application_runs, jobs, workflow_events).
+      - Executes multi-turn research via the Researcher orchestrator without holding DB locks.
+      - Enforces Phase F epistemic sufficiency gating (distinguishing facts from sufficient research).
+      - Executes commercial signal identification and strategy formulation via SignalStrategyService.
+      - Persists final strategy blueprints and stage execution records for audit and explainability.
+      - Supports run retrieval, stage inspection, and deep evidence provenance after process restart.
+    """
+
+    def __init__(
+        self,
+        state_store: StateStore,
+        researcher: Optional[Researcher] = None,
+        strategy_service: Optional[SignalStrategyService] = None,
+    ) -> None:
+        self.state_store = state_store
+        self.researcher = researcher or Researcher(state_store=self.state_store)
+        self.strategy_service = strategy_service or SignalStrategyService()
+
+    def run(
+        self,
+        prospect: ProspectContext,
+        product: ProductContext,
+        outreach: OutreachContext,
+        run_id: Optional[str] = None,
+        max_research_iterations: int = 3,
+        allow_insufficient_research: bool = False,
+    ) -> RunResult:
+        """Execute the full end-to-end outreach pipeline with stage-level persistence."""
+        # Ensure database is initialized and schema is valid before executing pipeline
+        db_status = self.state_store.get_database_status()
+        if not db_status["file_exists"] or db_status["table_count"] == 0:
+            logger.info("Database not initialized. Auto-initializing schema at %s...", db_status["db_path"])
+            self.state_store.initialize()
+        elif not db_status["is_initialized"] or not db_status["is_schema_valid"]:
+            raise RuntimeError(
+                f"Database at {db_status['db_path']} has an incompatible schema: {db_status['incompatibility_details']}. "
+                f"Per Zamp manual reset policy, back up your data if needed, delete the database file, and run 'zamp db init'."
+            )
+
+        active_run_id = run_id or str(uuid.uuid4())
+        existing_run = self.state_store.get_run(active_run_id) if run_id else None
+
+        if existing_run:
+            job_id = existing_run.get("job_id") or f"job-{active_run_id[:8]}"
+            session_id = existing_run.get("research_session_id") or f"session-{active_run_id[:8]}"
+            context_id = existing_run.get("context_id") or str(uuid.uuid4())
+            prospect_id = existing_run["prospect_id"]
+            if existing_run.get("stage_statuses_json"):
+                try:
+                    loaded = json.loads(existing_run["stage_statuses_json"])
+                    stage_records = [StageExecutionRecord.model_validate(s) for s in loaded]
+                except Exception:
+                    stage_records = []
+            else:
+                stage_records = []
+        else:
+            job_id = f"job-{active_run_id[:8]}"
+            session_id = f"session-{active_run_id[:8]}"
+            context_id = str(uuid.uuid4())
+            stage_records = []
+
+        warnings: List[str] = []
+
+        start_time_iso = datetime.now(timezone.utc).isoformat()
+        current_stage = StageIdentifier.VALIDATION
+
+        # Helper to log and persist stage transitions
+        def record_stage(
+            stage: StageIdentifier,
+            status: StageStatus,
+            started_at: str,
+            details: Optional[Dict[str, Any]] = None,
+            error_message: Optional[str] = None,
+        ) -> StageExecutionRecord:
+            completed_at = datetime.now(timezone.utc).isoformat()
+            t0 = datetime.fromisoformat(started_at)
+            t1 = datetime.fromisoformat(completed_at)
+            duration_ms = (t1 - t0).total_seconds() * 1000.0
+
+            rec = StageExecutionRecord(
+                stage=stage,
+                status=status,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=round(duration_ms, 2),
+                details=details or {},
+                error_message=error_message,
+            )
+            stage_records.append(rec)
+
+            # Persist stage event into workflow_events if job/session available
+            try:
+                with self.state_store.uow() as uow:
+                    uow.jobs.record_workflow_event(
+                        event_id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        job_id=job_id,
+                        event_type=f"stage_{stage.value}_{status.value}",
+                        payload=json.dumps({
+                            "stage": stage.value,
+                            "status": status.value,
+                            "duration_ms": rec.duration_ms,
+                            "details": details or {},
+                            "error": error_message,
+                        }),
+                    )
+            except Exception as ev_err:
+                logger.debug("Could not record workflow event: %s", ev_err)
+
+            return rec
+
+        try:
+            # =========================================================================
+            # Stage 1: Validation
+            # =========================================================================
+            current_stage = StageIdentifier.VALIDATION
+            s_start = datetime.now(timezone.utc).isoformat()
+
+            if not prospect.full_name or not prospect.company_name:
+                raise ValueError("Prospect full_name and company_name are required.")
+            if not product.product_name or not product.value_proposition:
+                raise ValueError("Product product_name and value_proposition are required.")
+
+            if not existing_run:
+                record_stage(
+                    stage=StageIdentifier.VALIDATION,
+                    status=StageStatus.COMPLETED,
+                    started_at=s_start,
+                    details={
+                        "prospect_name": prospect.full_name,
+                        "company_name": prospect.company_name,
+                        "product_name": product.product_name,
+                    },
+                )
+
+            # =========================================================================
+            # Stage 2: Initialization & Run Record Creation
+            # =========================================================================
+            current_stage = StageIdentifier.INITIALIZATION
+            s_start = datetime.now(timezone.utc).isoformat()
+
+            if existing_run:
+                # Update existing pending run and job to running status
+                self.state_store.update_run(
+                    run_id=active_run_id,
+                    status=RunStatus.RUNNING.value,
+                )
+                if job_id:
+                    try:
+                        with self.state_store.uow() as uow:
+                            uow.jobs.update_job_status(job_id=job_id, status="running")
+                    except Exception as j_err:
+                        logger.debug("Could not update job status: %s", j_err)
+            else:
+                prospect_id = self.state_store.save_prospect(prospect)
+                version_id = self.state_store.save_product_context(product)
+                self.state_store.save_outreach_context(
+                    outreach=outreach,
+                    prospect_id=prospect_id,
+                    version_id=version_id,
+                    context_id=context_id,
+                )
+
+                # Create research session and job records in database
+                with self.state_store.uow() as uow:
+                    uow.research.create_session(
+                        session_id=session_id,
+                        prospect_id=prospect_id,
+                        context_id=context_id,
+                        status="pending",
+                    )
+                    uow.jobs.create_job(
+                        job_id=job_id,
+                        job_type="outreach_pipeline",
+                        status="running",
+                        idempotency_key=active_run_id,
+                    )
+
+                # Create initial application_runs record
+                initial_stages_json = json.dumps([rec.model_dump() for rec in stage_records])
+                self.state_store.create_run(
+                    run_id=active_run_id,
+                    job_id=job_id,
+                    prospect_id=prospect_id,
+                    context_id=context_id,
+                    research_session_id=session_id,
+                    status=RunStatus.RUNNING.value,
+                    prospect_snapshot_json=prospect.model_dump_json(),
+                    product_snapshot_json=product.model_dump_json(),
+                    outreach_snapshot_json=outreach.model_dump_json(),
+                    stage_statuses_json=initial_stages_json,
+                    started_at=start_time_iso,
+                )
+
+            record_stage(
+                stage=StageIdentifier.INITIALIZATION,
+                status=StageStatus.COMPLETED,
+                started_at=s_start,
+                details={
+                    "run_id": active_run_id,
+                    "job_id": job_id,
+                    "prospect_id": prospect_id,
+                    "session_id": session_id,
+                },
+            )
+
+            # =========================================================================
+            # Stage 3: Research Execution (NO DB TRANSACTION HELD OPEN)
+            # =========================================================================
+            current_stage = StageIdentifier.RESEARCH
+            s_start = datetime.now(timezone.utc).isoformat()
+            logger.info("Executing research for run %s (session %s)", active_run_id, session_id)
+
+            research_package: ResearchPackage = self.researcher.conduct_research(
+                prospect=prospect,
+                outreach=outreach,
+                product=product,
+                session_id=session_id,
+                context_id=context_id,
+                max_iterations=max_research_iterations,
+            )
+
+            record_stage(
+                stage=StageIdentifier.RESEARCH,
+                status=StageStatus.COMPLETED,
+                started_at=s_start,
+                details={
+                    "facts_count": len(research_package.facts),
+                    "sources_count": len(research_package.sources),
+                    "is_sufficient": research_package.is_sufficient,
+                    "is_complete": research_package.is_complete,
+                },
+            )
+
+            # =========================================================================
+            # Stage 4: Epistemic Sufficiency Gating
+            # =========================================================================
+            current_stage = StageIdentifier.SUFFICIENCY_GATE
+            s_start = datetime.now(timezone.utc).isoformat()
+
+            # Rule A: Zero facts is an automatic failure
+            if len(research_package.facts) == 0:
+                reason = "Research yielded zero corroborated facts for prospect or company."
+                warnings.append(reason)
+                record_stage(
+                    stage=StageIdentifier.SUFFICIENCY_GATE,
+                    status=StageStatus.FAILED,
+                    started_at=s_start,
+                    details={"gate_decision": "halt", "reason": reason},
+                )
+                return self._finalize_run(
+                    run_id=active_run_id,
+                    job_id=job_id,
+                    status=RunStatus.INSUFFICIENT_RESEARCH,
+                    prospect=prospect,
+                    product=product,
+                    outreach=outreach,
+                    research_session_id=session_id,
+                    research_package=research_package,
+                    strategy_result=None,
+                    stage_records=stage_records,
+                    warnings=warnings,
+                    error_message=reason,
+                    started_at=start_time_iso,
+                )
+
+            # Rule B: Unresolved or ambiguous identity is fatal unless allow_insufficient_research is requested
+            had_sufficiency_warning = False
+            if research_package.prospect_entity and research_package.prospect_entity.resolution_status in (
+                ResolutionStatus.UNRESOLVED,
+                ResolutionStatus.AMBIGUOUS,
+            ):
+                reason = (
+                    f"Prospect identity resolution failed with status: "
+                    f"{research_package.prospect_entity.resolution_status.value}."
+                )
+                warnings.append(reason)
+                if not allow_insufficient_research:
+                    record_stage(
+                        stage=StageIdentifier.SUFFICIENCY_GATE,
+                        status=StageStatus.FAILED,
+                        started_at=s_start,
+                        details={"gate_decision": "halt", "reason": reason},
+                    )
+                    return self._finalize_run(
+                        run_id=active_run_id,
+                        job_id=job_id,
+                        status=RunStatus.INSUFFICIENT_RESEARCH,
+                        prospect=prospect,
+                        product=product,
+                        outreach=outreach,
+                        research_session_id=session_id,
+                        research_package=research_package,
+                        strategy_result=None,
+                        stage_records=stage_records,
+                        warnings=warnings,
+                        error_message=reason,
+                        started_at=start_time_iso,
+                    )
+                else:
+                    had_sufficiency_warning = True
+                    warnings.append(f"[Warning: Unresolved Identity Overridden] {reason}")
+
+            # Rule C: Epistemic insufficiency evaluation from Phase F
+            if not research_package.is_sufficient:
+                missing_str = ", ".join(research_package.missing_information) if research_package.missing_information else "Unmet objectives"
+                reason = f"Research declared insufficient by sufficiency evaluator: {missing_str}"
+                
+                if not allow_insufficient_research:
+                    warnings.append(reason)
+                    record_stage(
+                        stage=StageIdentifier.SUFFICIENCY_GATE,
+                        status=StageStatus.FAILED,
+                        started_at=s_start,
+                        details={"gate_decision": "halt", "reason": reason, "missing": research_package.missing_information},
+                    )
+                    return self._finalize_run(
+                        run_id=active_run_id,
+                        job_id=job_id,
+                        status=RunStatus.INSUFFICIENT_RESEARCH,
+                        prospect=prospect,
+                        product=product,
+                        outreach=outreach,
+                        research_session_id=session_id,
+                        research_package=research_package,
+                        strategy_result=None,
+                        stage_records=stage_records,
+                        warnings=warnings,
+                        error_message=reason,
+                        started_at=start_time_iso,
+                    )
+                else:
+                    had_sufficiency_warning = True
+                    warnings.append(f"[Warning: Insufficient Research Overridden] {reason}")
+
+            record_stage(
+                stage=StageIdentifier.SUFFICIENCY_GATE,
+                status=StageStatus.COMPLETED,
+                started_at=s_start,
+                details={
+                    "gate_decision": "proceed",
+                    "is_sufficient": research_package.is_sufficient,
+                    "warnings": warnings,
+                },
+            )
+
+            # =========================================================================
+            # Stage 5: Signal Strategy Synthesis (NO DB TRANSACTION HELD OPEN)
+            # =========================================================================
+            current_stage = StageIdentifier.SIGNAL_STRATEGY
+            s_start = datetime.now(timezone.utc).isoformat()
+            logger.info("Developing signal strategy for run %s", active_run_id)
+
+            strategy_result: StrategyResult = self.strategy_service.develop_strategy(
+                research_package=research_package,
+                prospect=prospect,
+                product=product,
+                outreach=outreach,
+            )
+
+            record_stage(
+                stage=StageIdentifier.SIGNAL_STRATEGY,
+                status=StageStatus.COMPLETED if strategy_result.is_viable else StageStatus.FAILED,
+                started_at=s_start,
+                details={
+                    "is_viable": strategy_result.is_viable,
+                    "rejection_reason": strategy_result.rejection_reason,
+                    "messaging_approach": strategy_result.strategy.messaging_approach if strategy_result.strategy else None,
+                },
+            )
+
+            # =========================================================================
+            # Stage 6: Strategy Viability Check & Status Determination
+            # =========================================================================
+            if not strategy_result.is_viable:
+                rejection = strategy_result.rejection_reason or "No viable commercial signal identified."
+                warnings.extend(strategy_result.unviable_reasons)
+                final_status = RunStatus.NO_VIABLE_SIGNAL
+            elif had_sufficiency_warning:
+                final_status = RunStatus.COMPLETED_WITH_WARNINGS
+            else:
+                final_status = RunStatus.COMPLETED
+
+            return self._finalize_run(
+                run_id=active_run_id,
+                job_id=job_id,
+                status=final_status,
+                prospect=prospect,
+                product=product,
+                outreach=outreach,
+                research_session_id=session_id,
+                research_package=research_package,
+                strategy_result=strategy_result,
+                stage_records=stage_records,
+                warnings=warnings,
+                error_message=strategy_result.rejection_reason if not strategy_result.is_viable else None,
+                started_at=start_time_iso,
+            )
+
+        except Exception as exc:
+            logger.error("Unhandled error in application run %s at stage %s: %s", active_run_id, current_stage, exc, exc_info=True)
+            record_stage(
+                stage=current_stage,
+                status=StageStatus.FAILED,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                error_message=str(exc),
+            )
+            return self._finalize_run(
+                run_id=active_run_id,
+                job_id=job_id,
+                status=RunStatus.FAILED,
+                prospect=prospect,
+                product=product,
+                outreach=outreach,
+                research_session_id=session_id,
+                research_package=None,
+                strategy_result=None,
+                stage_records=stage_records,
+                warnings=warnings,
+                error_message=str(exc),
+                started_at=start_time_iso,
+            )
+
+    def _finalize_run(
+        self,
+        run_id: str,
+        job_id: str,
+        status: RunStatus,
+        prospect: ProspectContext,
+        product: ProductContext,
+        outreach: OutreachContext,
+        research_session_id: Optional[str],
+        research_package: Optional[ResearchPackage],
+        strategy_result: Optional[StrategyResult],
+        stage_records: List[StageExecutionRecord],
+        warnings: List[str],
+        error_message: Optional[str],
+        started_at: str,
+    ) -> RunResult:
+        """Atomically persist run completion state, update job record, and return RunResult."""
+        completed_at_iso = datetime.now(timezone.utc).isoformat()
+        stages_json = json.dumps([rec.model_dump() for rec in stage_records])
+        warnings_json = json.dumps(warnings) if warnings else None
+        strat_json = strategy_result.model_dump_json() if strategy_result else None
+
+        # 1. Update application_runs row
+        self.state_store.update_run(
+            run_id=run_id,
+            status=status.value,
+            research_session_id=research_session_id,
+            strategy_result_json=strat_json,
+            stage_statuses_json=stages_json,
+            warnings_json=warnings_json,
+            error_message=error_message,
+            completed_at=completed_at_iso,
+        )
+
+        # 2. Update jobs table
+        job_outcome = "completed" if status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS) else "failed"
+        try:
+            with self.state_store.uow() as uow:
+                uow.jobs.update_job_status(
+                    job_id=job_id,
+                    status=job_outcome,
+                    completed_at=completed_at_iso,
+                    error_message=error_message,
+                )
+        except Exception as j_err:
+            logger.debug("Could not update job status: %s", j_err)
+
+        return RunResult(
+            run_id=run_id,
+            status=status,
+            prospect=prospect,
+            product=product,
+            outreach=outreach,
+            research_session_id=research_session_id,
+            research_package=research_package,
+            strategy_result=strategy_result,
+            stage_records=stage_records,
+            warnings=warnings,
+            error_message=error_message,
+            started_at=started_at,
+            completed_at=completed_at_iso,
+        )
+
+    def get_run(self, run_id: str) -> Optional[ApplicationRunSnapshot]:
+        """Retrieve and reconstruct a previous application run from SQLite."""
+        row = self.state_store.get_run(run_id)
+        if not row:
+            return None
+
+        prospect = ProspectContext.model_validate_json(row["prospect_snapshot_json"])
+        product = ProductContext.model_validate_json(row["product_snapshot_json"])
+        outreach = OutreachContext.model_validate_json(row["outreach_snapshot_json"])
+
+        strategy_result = None
+        if row.get("strategy_result_json"):
+            strategy_result = StrategyResult.model_validate_json(row["strategy_result_json"])
+
+        stage_statuses = json.loads(row["stage_statuses_json"]) if row.get("stage_statuses_json") else []
+        warnings = json.loads(row["warnings_json"]) if row.get("warnings_json") else []
+
+        return ApplicationRunSnapshot(
+            run_id=row["run_id"],
+            job_id=row.get("job_id"),
+            prospect_id=row["prospect_id"],
+            context_id=row.get("context_id"),
+            research_session_id=row.get("research_session_id"),
+            status=RunStatus(row["status"]),
+            prospect=prospect,
+            product=product,
+            outreach=outreach,
+            strategy_result=strategy_result,
+            stage_statuses=stage_statuses,
+            warnings=warnings,
+            error_message=row.get("error_message"),
+            started_at=row["started_at"],
+            completed_at=row.get("completed_at"),
+        )
+
+    def list_runs(self, limit: int = 50, status: Optional[RunStatus] = None) -> List[Dict[str, Any]]:
+        """List historical application runs."""
+        status_str = status.value if status is not None else None
+        return self.state_store.list_runs(limit=limit, status=status_str)
+
+    def get_run_stages(self, run_id: str) -> List[StageExecutionRecord]:
+        """Retrieve stage execution timeline for a run."""
+        row = self.state_store.get_run(run_id)
+        if not row or not row.get("stage_statuses_json"):
+            return []
+        raw_stages = json.loads(row["stage_statuses_json"])
+        return [StageExecutionRecord.model_validate(s) for s in raw_stages]
+
+    def get_strategy_explainability(self, run_id: str) -> Dict[str, Any]:
+        """Retrieve complete domain explainability tree connecting strategy back to evidence and sources."""
+        snapshot = self.get_run(run_id)
+        if not snapshot or not snapshot.strategy_result or not snapshot.strategy_result.strategy:
+            return {"error": f"No viable strategy available for run {run_id}"}
+
+        strategy = snapshot.strategy_result.strategy
+        primary_ranked = strategy.primary_signal
+        candidate_signal = primary_ranked.signal
+        session_id = snapshot.research_session_id
+
+        # Query supporting facts and evidence from database
+        supporting_facts: List[Dict[str, Any]] = []
+        evidence_chain: List[Dict[str, Any]] = []
+
+        if session_id and candidate_signal.supporting_fact_ids:
+            with self.state_store.uow() as uow:
+                for fid in candidate_signal.supporting_fact_ids:
+                    fact_row = uow.assertions.get_canonical_fact(fid)
+                    if fact_row:
+                        supporting_facts.append(fact_row)
+                        ev_passages = uow.assertions.get_evidence_for_fact(fid)
+                        for ev_row in ev_passages:
+                            src_row = uow.sources.get_source(ev_row["source_id"])
+                            evidence_chain.append({
+                                "fact_id": fid,
+                                "claim_text": fact_row["claim_text"],
+                                "evidence_id": ev_row["evidence_id"],
+                                "verbatim_excerpt": ev_row["verbatim_excerpt"],
+                                "excerpt_validated": bool(ev_row["excerpt_validated"]),
+                                "event_date": ev_row["event_date"],
+                                "credibility_score": ev_row["credibility_score"],
+                                "source_url": src_row["canonical_url"] if src_row else None,
+                                "domain": src_row["domain"] if src_row else None,
+                            })
+
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "prospect_name": snapshot.prospect.full_name,
+            "company_name": snapshot.prospect.company_name,
+            "messaging_approach": strategy.messaging_approach,
+            "central_message": strategy.central_message,
+            "suggested_subject_line": strategy.suggested_subject_line,
+            "cta": strategy.cta,
+            "tone_guidance": strategy.tone_guidance,
+            "primary_signal": primary_ranked.model_dump(),
+            "supporting_signals": [s.model_dump() for s in strategy.supporting_signals],
+            "alignment": strategy.alignment.model_dump(),
+            "supporting_facts": supporting_facts,
+            "evidence_chain": evidence_chain,
+            "rejection_reasons": snapshot.strategy_result.unviable_reasons,
+        }
+
+    def create_pending_run(
+        self,
+        prospect: ProspectContext,
+        product: ProductContext,
+        outreach: OutreachContext,
+        run_id: Optional[str] = None,
+    ) -> ApplicationRunSnapshot:
+        """Validate input context and persist an initial run in PENDING status before asynchronous execution."""
+        db_status = self.state_store.get_database_status()
+        if not db_status["file_exists"] or db_status["table_count"] == 0:
+            self.state_store.initialize()
+        elif not db_status["is_initialized"] or not db_status["is_schema_valid"]:
+            raise RuntimeError(
+                f"Database at {db_status['db_path']} has an incompatible schema: {db_status['incompatibility_details']}."
+            )
+
+        if not prospect.full_name or not prospect.company_name:
+            raise ValueError("Prospect full_name and company_name are required.")
+        if not product.product_name or not product.value_proposition:
+            raise ValueError("Product product_name and value_proposition are required.")
+
+        active_run_id = run_id or str(uuid.uuid4())
+        job_id = f"job-{active_run_id[:8]}"
+        session_id = f"session-{active_run_id[:8]}"
+        context_id = str(uuid.uuid4())
+        start_time_iso = datetime.now(timezone.utc).isoformat()
+
+        prospect_id = self.state_store.save_prospect(prospect)
+        version_id = self.state_store.save_product_context(product)
+        self.state_store.save_outreach_context(
+            outreach=outreach,
+            prospect_id=prospect_id,
+            version_id=version_id,
+            context_id=context_id,
+        )
+
+        with self.state_store.uow() as uow:
+            uow.research.create_session(
+                session_id=session_id,
+                prospect_id=prospect_id,
+                context_id=context_id,
+                status="pending",
+            )
+            uow.jobs.create_job(
+                job_id=job_id,
+                job_type="outreach_pipeline",
+                status="pending",
+                idempotency_key=active_run_id,
+            )
+
+        initial_stages = [
+            StageExecutionRecord(
+                stage=StageIdentifier.VALIDATION,
+                status=StageStatus.COMPLETED,
+                started_at=start_time_iso,
+                completed_at=start_time_iso,
+                duration_ms=0.0,
+                details={
+                    "prospect_name": prospect.full_name,
+                    "company_name": prospect.company_name,
+                    "product_name": product.product_name,
+                },
+            )
+        ]
+
+        self.state_store.create_run(
+            run_id=active_run_id,
+            job_id=job_id,
+            prospect_id=prospect_id,
+            context_id=context_id,
+            research_session_id=session_id,
+            status=RunStatus.PENDING.value,
+            prospect_snapshot_json=prospect.model_dump_json(),
+            product_snapshot_json=product.model_dump_json(),
+            outreach_snapshot_json=outreach.model_dump_json(),
+            stage_statuses_json=json.dumps([rec.model_dump() for rec in initial_stages]),
+            started_at=start_time_iso,
+        )
+
+        snapshot = self.get_run(active_run_id)
+        if not snapshot:
+            raise RuntimeError(f"Failed to retrieve newly created pending run {active_run_id}")
+        return snapshot
+
+    def get_research_inspection(self, session_or_run_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve complete structured research inspection for a session or run ID."""
+        target_session_id = session_or_run_id
+        target_run_id = None
+
+        row = self.state_store.get_run(session_or_run_id)
+        if not row:
+            matched_runs = [r for r in self.state_store.list_runs(limit=100) if r["run_id"].startswith(session_or_run_id)]
+            if matched_runs:
+                row = matched_runs[0]
+        if row:
+            target_run_id = row["run_id"]
+            if row.get("research_session_id"):
+                target_session_id = row["research_session_id"]
+
+        with self.state_store.uow() as uow:
+            session = uow.research.get_session(target_session_id)
+            if not session:
+                cursor = uow.research.conn.execute("SELECT session_id FROM research_sessions;")
+                matched_sess = [r[0] for r in cursor.fetchall() if r[0].startswith(session_or_run_id)]
+                if matched_sess:
+                    target_session_id = matched_sess[0]
+                    session = uow.research.get_session(target_session_id)
+
+            if not session:
+                return None
+
+            objectives = uow.research.get_objectives(target_session_id)
+            raw_facts = uow.assertions.get_facts_for_session(target_session_id)
+            conflicts = uow.assertions.get_conflicts_for_session(target_session_id)
+            assessments = uow.entities.get_assessments(session_id=target_session_id)
+            iterations = uow.orchestration.list_iterations(target_session_id)
+            latest_assessment = uow.orchestration.get_latest_assessment(target_session_id)
+
+            facts: List[Dict[str, Any]] = []
+            for f in raw_facts:
+                fid = f["fact_id"]
+                ev_passages = uow.assertions.get_evidence_for_fact(fid)
+                evidence_list: List[Dict[str, Any]] = []
+                for ev in ev_passages:
+                    src = uow.sources.get_source(ev["source_id"]) if ev.get("source_id") else None
+                    evidence_list.append({
+                        "evidence_id": ev["evidence_id"],
+                        "verbatim_excerpt": ev["verbatim_excerpt"],
+                        "excerpt_validated": bool(ev.get("excerpt_validated")),
+                        "credibility_score": float(ev["credibility_score"]) if ev.get("credibility_score") is not None else 0.5,
+                        "event_date": ev.get("event_date"),
+                        "source": {
+                            "source_id": src["source_id"],
+                            "canonical_url": src["canonical_url"],
+                            "domain": src.get("domain"),
+                            "source_type": src.get("source_type"),
+                        } if src else None,
+                    })
+
+                facts.append({
+                    "fact_id": fid,
+                    "fact_category": f.get("fact_category", "other"),
+                    "claim_text": f["claim_text"],
+                    "composite_confidence": f.get("composite_confidence", "medium"),
+                    "primary_event_date": f.get("primary_event_date"),
+                    "created_at": f.get("created_at"),
+                    "evidence": evidence_list,
+                })
+
+            identities: List[Dict[str, Any]] = []
+            seen_entity_ids = set()
+            for ass in assessments:
+                eid = ass["entity_id"]
+                ent = uow.entities.get_entity(eid)
+                if ent and eid not in seen_entity_ids:
+                    seen_entity_ids.add(eid)
+                    identities.append({
+                        "entity_id": eid,
+                        "entity_type": ent["entity_type"],
+                        "raw_name": ent["raw_name"],
+                        "canonical_name": ent.get("canonical_name"),
+                        "resolution_status": ass["resolution_status"],
+                        "confidence": ass["confidence"],
+                        "rationale": ass["rationale"],
+                        "assessed_by": ass.get("assessed_by", "entity_resolver"),
+                        "assessed_at": ass.get("assessed_at"),
+                    })
+
+            return {
+                "session_id": target_session_id,
+                "run_id": target_run_id,
+                "status": session["status"],
+                "is_sufficient": bool(session.get("is_sufficient")),
+                "is_complete": bool(session.get("is_complete")),
+                "sufficiency_notes": session.get("sufficiency_notes"),
+                "started_at": session.get("started_at"),
+                "completed_at": session.get("completed_at"),
+                "objectives": objectives,
+                "facts": facts,
+                "conflicts": conflicts,
+                "identities": identities,
+                "iterations": iterations,
+                "latest_assessment": latest_assessment,
+            }
+
+    def reconcile_interrupted_runs(self) -> int:
+        """Find runs left in RUNNING status (e.g., from process termination) and mark them FAILED."""
+        active_runs = self.state_store.list_runs(limit=1000, status=RunStatus.RUNNING.value)
+        reconciled = 0
+        now = datetime.now(timezone.utc).isoformat()
+        for r in active_runs:
+            run_id = r["run_id"]
+            stages = self.get_run_stages(run_id)
+            stages.append(
+                StageExecutionRecord(
+                    stage=StageIdentifier.FINALIZATION,
+                    status=StageStatus.FAILED,
+                    started_at=now,
+                    completed_at=now,
+                    duration_ms=0.0,
+                    error_message="Execution interrupted by server shutdown or restart",
+                )
+            )
+            stages_json = json.dumps([s.model_dump() for s in stages])
+            self.state_store.update_run(
+                run_id=run_id,
+                status=RunStatus.FAILED.value,
+                stage_statuses_json=stages_json,
+                error_message="Execution interrupted by server shutdown or restart",
+                completed_at=now,
+            )
+            reconciled += 1
+            logger.info("Reconciled interrupted run %s to FAILED status", run_id)
+        return reconciled
+
