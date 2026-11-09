@@ -1,0 +1,2 @@
+class GeneratorNotFoundError(Exception):
+    pass
