@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,52 @@ def _ensure_application_runs_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_outreach_drafts_columns(conn: sqlite3.Connection) -> None:
+    """Ensure newly added columns exist on outreach_drafts table."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(outreach_drafts);")
+    cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if not cols:
+        return
+
+    columns_to_add = [
+        ("current_revision", "INTEGER NOT NULL DEFAULT 1"),
+    ]
+    for col_name, col_def in columns_to_add:
+        if col_name not in cols:
+            conn.execute(f"ALTER TABLE outreach_drafts ADD COLUMN {col_name} {col_def};")
+    conn.commit()
+
+
+def _ensure_human_review_events_columns(conn: sqlite3.Connection) -> None:
+    """Ensure newly added columns exist on human_review_events table."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(human_review_events);")
+    cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if not cols:
+        return
+
+    columns_to_add = [
+        ("action", "TEXT NOT NULL DEFAULT 'APPROVED'"),
+        ("decision", "TEXT"),
+        ("reviewed_revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("resulting_revision", "INTEGER NOT NULL DEFAULT 1"),
+        ("reason_code", "TEXT"),
+        ("original_subject", "TEXT"),
+        ("original_body", "TEXT"),
+        ("resulting_subject", "TEXT"),
+        ("resulting_body", "TEXT"),
+        ("char_edit_distance", "INTEGER"),
+        ("word_edit_distance", "INTEGER"),
+        ("normalized_char_ratio", "REAL"),
+        ("normalized_word_ratio", "REAL"),
+    ]
+    for col_name, col_def in columns_to_add:
+        if col_name not in cols:
+            conn.execute(f"ALTER TABLE human_review_events ADD COLUMN {col_name} {col_def};")
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Execute the authoritative schema script against the provided connection idempotently.
     
@@ -107,6 +153,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(schema_sql)
         _ensure_model_executions_columns(conn)
         _ensure_application_runs_columns(conn)
+        _ensure_outreach_drafts_columns(conn)
+        _ensure_human_review_events_columns(conn)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize database schema: {exc}") from exc
 

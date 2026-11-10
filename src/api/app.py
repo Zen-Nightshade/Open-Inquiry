@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from repo_paths import get_db_path
 from src.api.routes.health import router as health_router
+from src.api.routes.reviews import router as reviews_router
 from src.api.routes.runs import router as runs_router
 from src.api.schemas.common import ErrorDetail, ErrorEnvelope
 from src.config.settings import init_env
@@ -24,8 +25,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup reconciliation and shutdown cleanup."""
     init_env()
-    active_db_path = getattr(app.state, "db_path", None)
-    logger.info("Starting Zamp API Server with database: %s", active_db_path or get_db_path())
+    active_db_path = getattr(app.state, "db_path", None) or str(get_db_path())
+    logger.info("Starting Open Inquiry API Server with database: %s", active_db_path)
 
     try:
         store = StateStore(db_path=active_db_path)
@@ -38,15 +39,15 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    logger.info("Zamp API Server shut down.")
+    logger.info("Open Inquiry API Server shut down.")
 
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
-    """FastAPI application factory for Zamp HTTP API."""
+    """FastAPI application factory for Open Inquiry HTTP API."""
     app = FastAPI(
-        title="Zamp Research & Outreach Strategy API",
+        title="Open Inquiry Research & Outreach Strategy API",
         description=(
-            "HTTP interface for Zamp: Autonomous Evidence-Grounded Research & Outreach Strategy Engine. "
+            "HTTP interface for Open Inquiry: Autonomous Evidence-Grounded Research & Outreach Strategy Engine. "
             "Enables clients to launch asynchronous prospect research, monitor stage execution, inspect "
             "canonical facts with full passage-level provenance, and retrieve strategic outreach blueprints."
         ),
@@ -57,8 +58,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Store active database path on app state
-    app.state.db_path = db_path or os.environ.get("ZAMP_DB_PATH")
+    # Store active database path on app state via centralized resolution
+    app.state.db_path = str(get_db_path(db_path))
 
     # Configure CORS
     app.add_middleware(
@@ -117,5 +118,6 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # Register routers
     app.include_router(health_router)
     app.include_router(runs_router)
+    app.include_router(reviews_router)
 
     return app

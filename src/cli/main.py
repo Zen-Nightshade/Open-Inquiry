@@ -13,7 +13,13 @@ from rich.text import Text
 
 from repo_paths import get_db_path
 from src.config.settings import init_env
-from src.context.models import OutreachContext, ProductContext, ProspectContext
+from src.context.models import (
+    CapabilityNode,
+    OutreachContext,
+    ProductContext,
+    ProductContract,
+    ProspectContext,
+)
 from src.db.state_store import StateStore
 from src.orchestration import (
     ApplicationOrchestrator,
@@ -26,8 +32,8 @@ from src.orchestration import (
 console = Console()
 
 app = typer.Typer(
-    name="zamp",
-    help="Zamp: Autonomous Evidence-Grounded Research & Outreach Engine",
+    name="open-inquiry",
+    help="Open Inquiry: Autonomous Evidence-Grounded Research & Outreach Engine",
     add_completion=False,
 )
 
@@ -35,16 +41,18 @@ db_app = typer.Typer(help="Manage and inspect SQLite database and schema.")
 run_app = typer.Typer(no_args_is_help=False, help="Execute and inspect application runs.")
 research_app = typer.Typer(help="Inspect research sessions, canonical facts, and evidence.")
 strategy_app = typer.Typer(help="Inspect strategy blueprints and domain explainability.")
+review_app = typer.Typer(help="Manage and inspect outreach drafts, human review decisions, and review telemetry.")
 
 app.add_typer(db_app, name="db")
 app.add_typer(run_app, name="run")
 app.add_typer(research_app, name="research")
 app.add_typer(strategy_app, name="strategy")
+app.add_typer(review_app, name="review")
 
 
 def _get_orchestrator(db_path: Optional[str] = None) -> ApplicationOrchestrator:
     init_env()
-    store = StateStore(db_path=db_path)
+    store = StateStore(db_path=get_db_path(db_path))
     return ApplicationOrchestrator(state_store=store)
 
 
@@ -114,6 +122,7 @@ def run_pipeline(
     designation: Optional[str] = typer.Option(None, "--designation", "-r", help="Prospect role or title"),
     linkedin: Optional[str] = typer.Option(None, "--linkedin", "-l", help="Prospect LinkedIn URL"),
     input_file: Optional[Path] = typer.Option(None, "--input-file", "-f", help="JSON file containing prospect, product, outreach contexts"),
+    contract_file: Optional[Path] = typer.Option(None, "--contract-file", help="JSON file containing structured ProductContract"),
     product_name: Optional[str] = typer.Option(None, "--product", "-p", help="Product name"),
     product_desc: Optional[str] = typer.Option(None, "--product-desc", help="Product description"),
     value_prop: Optional[str] = typer.Option(None, "--value-prop", help="Product value proposition"),
@@ -127,7 +136,7 @@ def run_pipeline(
     non_interactive: bool = typer.Option(False, "--non-interactive", help="Disallow interactive input prompting"),
     db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
 ):
-    """Execute the end-to-end Zamp outreach pipeline for a prospect."""
+    """Execute the end-to-end Open Inquiry outreach pipeline for a prospect."""
     if ctx.invoked_subcommand is not None:
         return
 
@@ -149,33 +158,167 @@ def run_pipeline(
             console.print(f"[bold red]Failed to parse JSON input file:[/bold red] {err}")
             raise typer.Exit(1)
 
-    # 2. Reconcile parameters with CLI overrides or interactive prompts
-    p_name = name or prospect_data.get("full_name")
-    p_company = company or prospect_data.get("company_name")
-    p_domain = domain or prospect_data.get("company_domain")
-    p_role = designation or prospect_data.get("designation")
-    p_linkedin = linkedin or prospect_data.get("linkedin_url")
+    # 2. Reconcile and validate Prospect Context
+    p_name = (name or prospect_data.get("full_name") or "").strip()
+    p_company = (company or prospect_data.get("company_name") or "").strip()
+    p_domain = (domain or prospect_data.get("company_domain") or "").strip() or None
+    p_role = (designation or prospect_data.get("designation") or "").strip() or None
+    p_linkedin = (linkedin or prospect_data.get("linkedin_url") or "").strip() or None
 
-    prod_name = product_name or product_data.get("product_name") or "Zamp Autonomous Engine"
-    prod_desc = product_desc or product_data.get("description") or "Autonomous evidence-grounded research and outreach platform."
-    prod_vp = value_prop or product_data.get("value_proposition") or "Eliminate cold outreach spam through verified commercial signals and deep research."
-    caps_list = [c.strip() for c in capabilities.split(",")] if capabilities else product_data.get("capabilities", [
-        "Real-time company intelligence",
-        "Multi-turn web evidence corroboration",
-        "Automated commercial signal identification",
-    ])
+    missing_prospect = []
+    if not p_name:
+        missing_prospect.append("full_name (--name / -n)")
+    if not p_company:
+        missing_prospect.append("company_name (--company / -c)")
 
-    out_obj = objective or outreach_data.get("objective") or "Explore strategic partnership and pipeline expansion"
-    s_name = sender_name or outreach_data.get("sender_name") or "Alex Rivers"
-    s_comp = sender_company or outreach_data.get("sender_company") or "Zamp AI"
-    s_ident = sender_identity or outreach_data.get("sender_identity") or f"{s_name}, Solutions Architect at {s_comp}"
-
-    if not p_name or not p_company:
-        if non_interactive or not sys.stdin.isatty():
-            console.print("[bold red]Error: Missing required prospect full_name or company_name in non-interactive mode.[/bold red]")
+    if missing_prospect:
+        if non_interactive:
+            console.print(
+                f"[bold red]Error: Missing required prospect context: {', '.join(missing_prospect)} in non-interactive mode.[/bold red]"
+            )
             raise typer.Exit(1)
-        p_name = typer.prompt("Enter prospect full name", default=p_name)
-        p_company = typer.prompt("Enter prospect company name", default=p_company)
+        try:
+            if not p_name:
+                p_name = typer.prompt("Enter prospect full name").strip()
+                if not p_name:
+                    console.print("[bold red]Error: Prospect full name cannot be blank.[/bold red]")
+                    raise typer.Exit(1)
+            if not p_company:
+                p_company = typer.prompt("Enter prospect company name").strip()
+                if not p_company:
+                    console.print("[bold red]Error: Prospect company name cannot be blank.[/bold red]")
+                    raise typer.Exit(1)
+        except (EOFError, KeyboardInterrupt):
+            console.print("[bold red]Error: Prompt interrupted or end-of-file reached.[/bold red]")
+            raise typer.Exit(1)
+
+    # 3. Reconcile and validate Product Context (NO SILENT FABRICATION)
+    contract_instance: Optional[ProductContract] = None
+
+    if contract_file:
+        if not contract_file.exists():
+            console.print(f"[bold red]Error: Contract file {contract_file} does not exist.[/bold red]")
+            raise typer.Exit(1)
+        try:
+            raw_c = json.loads(contract_file.read_text(encoding="utf-8"))
+            contract_instance = ProductContract.model_validate(raw_c)
+        except Exception as err:
+            console.print(f"[bold red]Error: Invalid product contract file:[/bold red] {err}")
+            raise typer.Exit(1)
+    elif "contract" in product_data and isinstance(product_data["contract"], dict):
+        try:
+            raw_c = dict(product_data["contract"])
+            if product_name and not raw_c.get("product_name"):
+                raw_c["product_name"] = product_name
+            if product_desc and not raw_c.get("description"):
+                raw_c["description"] = product_desc
+            if value_prop and not raw_c.get("value_proposition"):
+                raw_c["value_proposition"] = value_prop
+            contract_instance = ProductContract.model_validate(raw_c)
+        except Exception as err:
+            console.print(f"[bold red]Error: Invalid product contract in input data:[/bold red] {err}")
+            raise typer.Exit(1)
+    elif "capabilities" in product_data and any(isinstance(c, dict) for c in product_data["capabilities"]):
+        try:
+            cap_nodes = [CapabilityNode.model_validate(c) for c in product_data["capabilities"]]
+            lims = product_data.get("limitations", [])
+            contract_instance = ProductContract(
+                product_name=(product_name or product_data.get("product_name") or "").strip(),
+                description=(product_desc or product_data.get("description") or "").strip(),
+                value_proposition=(value_prop or product_data.get("value_proposition") or "").strip(),
+                capabilities=cap_nodes,
+                hard_exclusions=lims,
+                is_exhaustive=product_data.get("is_exhaustive", False),
+            )
+        except Exception as err:
+            console.print(f"[bold red]Error: Invalid structured capabilities in input data:[/bold red] {err}")
+            raise typer.Exit(1)
+
+    if contract_instance:
+        prod_name = (product_name or contract_instance.product_name or "").strip()
+        prod_desc = (product_desc or contract_instance.description or "").strip()
+        prod_vp = (value_prop or contract_instance.value_proposition or "").strip()
+        if capabilities:
+            caps_list = [c.strip() for c in capabilities.split(",") if c.strip()]
+        else:
+            caps_list = [c.name for c in contract_instance.capabilities]
+    else:
+        prod_name = (product_name or product_data.get("product_name") or "").strip()
+        prod_desc = (product_desc or product_data.get("description") or "").strip()
+        prod_vp = (value_prop or product_data.get("value_proposition") or "").strip()
+
+        if capabilities:
+            caps_list = [c.strip() for c in capabilities.split(",") if c.strip()]
+        elif "capabilities" in product_data:
+            raw_c = product_data["capabilities"]
+            if isinstance(raw_c, list):
+                caps_list = [c.strip() for c in raw_c if isinstance(c, str) and c.strip()]
+            elif isinstance(raw_c, str):
+                caps_list = [c.strip() for c in raw_c.split(",") if c.strip()]
+            else:
+                caps_list = []
+        else:
+            caps_list = []
+
+    missing_product = []
+    if not prod_name:
+        missing_product.append("product_name (--product / -p)")
+    if not prod_desc:
+        missing_product.append("description (--product-desc)")
+    if not prod_vp:
+        missing_product.append("value_proposition (--value-prop)")
+    if not caps_list:
+        missing_product.append("capabilities (--capabilities)")
+
+    if missing_product:
+        if non_interactive:
+            console.print(
+                f"[bold red]Error: Missing required product context: {', '.join(missing_product)}. "
+                f"In non-interactive mode, all required product fields must be provided via CLI options or an input file.[/bold red]"
+            )
+            raise typer.Exit(1)
+        try:
+            if not prod_name:
+                prod_name = typer.prompt("Enter product name").strip()
+                if not prod_name:
+                    console.print("[bold red]Error: Product name cannot be blank.[/bold red]")
+                    raise typer.Exit(1)
+            if not prod_desc:
+                prod_desc = typer.prompt("Enter product description").strip()
+                if not prod_desc:
+                    console.print("[bold red]Error: Product description cannot be blank.[/bold red]")
+                    raise typer.Exit(1)
+            if not prod_vp:
+                prod_vp = typer.prompt("Enter product value proposition").strip()
+                if not prod_vp:
+                    console.print("[bold red]Error: Product value proposition cannot be blank.[/bold red]")
+                    raise typer.Exit(1)
+            if not caps_list:
+                caps_raw = typer.prompt("Enter product capabilities (comma-separated)").strip()
+                caps_list = [c.strip() for c in caps_raw.split(",") if c.strip()]
+                if not caps_list:
+                    console.print("[bold red]Error: At least one non-empty product capability must be specified.[/bold red]")
+                    raise typer.Exit(1)
+        except (EOFError, KeyboardInterrupt):
+            console.print("[bold red]Error: Prompt interrupted or end-of-file reached.[/bold red]")
+            raise typer.Exit(1)
+
+    # 4. Reconcile Outreach Context
+    out_obj = (objective or outreach_data.get("objective") or "Explore strategic partnership and pipeline expansion").strip()
+    s_name = (sender_name or outreach_data.get("sender_name") or "").strip() or None
+    s_comp = (sender_company or outreach_data.get("sender_company") or "").strip() or None
+    raw_ident = (sender_identity or outreach_data.get("sender_identity") or "").strip()
+
+    if raw_ident:
+        s_ident = raw_ident
+    elif s_name and s_comp:
+        s_ident = f"{s_name}, Solutions Architect at {s_comp}"
+    elif s_name:
+        s_ident = s_name
+    elif s_comp:
+        s_ident = f"Solutions Lead at {s_comp}"
+    else:
+        s_ident = "Outreach Lead"
 
     prospect = ProspectContext(
         full_name=p_name,
@@ -189,6 +332,10 @@ def run_pipeline(
         description=prod_desc,
         capabilities=caps_list,
         value_proposition=prod_vp,
+        icp=product_data.get("icp"),
+        differentiators=product_data.get("differentiators", []),
+        limitations=product_data.get("limitations", []),
+        contract=contract_instance,
     )
     outreach = OutreachContext(
         objective=out_obj,
@@ -203,7 +350,7 @@ def run_pipeline(
         f"[bold white]Target Prospect:[/bold white] {prospect.full_name} ({prospect.designation or 'Role N/A'}) at [bold cyan]{prospect.company_name}[/bold cyan]\n"
         f"[bold white]Offering:[/bold white] {product.product_name} - {product.value_proposition}\n"
         f"[bold white]Max Iterations:[/bold white] {max_iterations}",
-        title="[bold green]Starting Zamp Outreach Pipeline[/bold green]",
+        title="[bold green]Starting Open Inquiry Outreach Pipeline[/bold green]",
         border_style="green",
     ))
 
@@ -564,21 +711,303 @@ def serve(
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
     db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
 ):
-    """Start Zamp HTTP API server."""
+    """Start Open Inquiry HTTP API server."""
     init_env()
-    if db_path:
-        os.environ["ZAMP_DB_PATH"] = db_path
+    from src.api.app import create_app
     import uvicorn
+
+    resolved_path = get_db_path(db_path)
 
     console.print(
         Panel(
-            f"[bold cyan]Starting Zamp API Server[/bold cyan]\n"
+            f"[bold cyan]Starting Open Inquiry API Server[/bold cyan]\n"
             f"Address: http://{host}:{port}\n"
-            f"Database: {get_db_path()}",
+            f"Database: {resolved_path}",
             border_style="cyan",
         )
     )
-    uvicorn.run("src.api.app:create_app", host=host, port=port, reload=reload, factory=True)
+    if reload:
+        if db_path:
+            os.environ["OPEN_INQUIRY_DB_PATH"] = str(resolved_path)
+        uvicorn.run("src.api.app:create_app", host=host, port=port, reload=True, factory=True)
+    else:
+        api_app = create_app(db_path=resolved_path)
+        uvicorn.run(api_app, host=host, port=port)
+
+
+def _get_review_service(db_path: Optional[str] = None) -> ReviewService:
+    from src.email_generation.review_service import ReviewService
+    init_env()
+    store = StateStore(db_path=get_db_path(db_path))
+    return ReviewService(state_store=store)
+
+
+# =============================================================================
+# Review Commands
+# =============================================================================
+
+@review_app.command("list")
+def review_list(
+    status: Optional[str] = typer.Option(None, "--status", help="Filter by review status (pending_review, approved, rejected)"),
+    limit: int = typer.Option(20, "--limit", "-l", help="Number of drafts to display"),
+    offset: int = typer.Option(0, "--offset", "-o", help="Offset"),
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """List outreach drafts with pagination and status filtering."""
+    service = _get_review_service(db_path)
+    drafts, total = service.list_drafts(limit=limit, offset=offset, status=status)
+
+    if not drafts:
+        console.print("[yellow]No outreach drafts found.[/yellow]")
+        return
+
+    table = Table(title=f"Outreach Drafts (Total: {total})", border_style="cyan")
+    table.add_column("Draft ID", style="bold cyan")
+    table.add_column("Rev", justify="center")
+    table.add_column("Status", justify="center")
+    table.add_column("Subject")
+    table.add_column("Words", justify="right")
+    table.add_column("Created At")
+
+    for d in drafts:
+        st = d.get("human_review_status", "pending_review")
+        if st == "approved":
+            st_styled = "[green]approved[/green]"
+        elif st == "rejected":
+            st_styled = "[red]rejected[/red]"
+        else:
+            st_styled = "[yellow]pending_review[/yellow]"
+
+        table.add_row(
+            d["draft_id"][:12] + "...",
+            str(d.get("current_revision", 1)),
+            st_styled,
+            d.get("subject", "")[:40],
+            str(d.get("word_count", 0)),
+            d.get("created_at", "")[:19],
+        )
+
+    console.print(table)
+
+
+@review_app.command("inspect")
+def review_inspect(
+    draft_id: str = typer.Argument(..., help="Draft identifier to inspect"),
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """Inspect full revision history and review events for a draft."""
+    service = _get_review_service(db_path)
+    try:
+        history = service.get_draft_history(draft_id)
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel(
+            f"[bold cyan]Draft ID:[/bold cyan] {history.draft_id}\n"
+            f"[bold cyan]Current Revision:[/bold cyan] v{history.current_revision}\n"
+            f"[bold cyan]Status:[/bold cyan] {history.status}\n"
+            f"[bold cyan]Created At:[/bold cyan] {history.created_at}\n\n"
+            f"[bold green]Current Subject:[/bold green] {history.current_subject}\n\n"
+            f"[bold green]Current Body:[/bold green]\n{history.current_body}",
+            title="Draft Summary",
+            border_style="cyan",
+        )
+    )
+
+    if history.revisions:
+        rev_table = Table(title="Revision History", border_style="blue")
+        rev_table.add_column("Rev", justify="center")
+        rev_table.add_column("Subject")
+        rev_table.add_column("Words", justify="right")
+        rev_table.add_column("Created By / Action")
+        rev_table.add_column("Timestamp")
+
+        for rev in history.revisions:
+            action_desc = rev.action_leading_to_revision.value if rev.action_leading_to_revision else "INITIAL"
+            rev_table.add_row(
+                f"v{rev.revision_number}",
+                rev.subject[:35],
+                str(rev.word_count),
+                f"{action_desc} ({rev.reviewer_id or 'system'})",
+                rev.created_at[:19],
+            )
+        console.print(rev_table)
+
+    if history.events:
+        evt_table = Table(title="Review Decisions Timeline", border_style="magenta")
+        evt_table.add_column("Event ID")
+        evt_table.add_column("Action")
+        evt_table.add_column("Rev Transition")
+        evt_table.add_column("Reviewer")
+        evt_table.add_column("Reason / Notes")
+        evt_table.add_column("Timestamp")
+
+        for ev in history.events:
+            reason = ev.reason_code.value if ev.reason_code else (ev.notes or "")
+            evt_table.add_row(
+                ev.event_id[:8] + "...",
+                ev.action.value,
+                f"v{ev.reviewed_revision} -> v{ev.resulting_revision}",
+                ev.reviewer_id or "anonymous",
+                reason[:30],
+                ev.timestamp[:19],
+            )
+        console.print(evt_table)
+
+
+@review_app.command("approve")
+def review_approve(
+    draft_id: str = typer.Argument(..., help="Draft identifier to approve"),
+    revision: int = typer.Option(..., "--revision", "-r", help="Expected current revision number (CAS check)"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="Reviewer identifier"),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Optional approval notes"),
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """Approve an outreach draft on a specific revision."""
+    service = _get_review_service(db_path)
+    try:
+        event = service.approve_draft(
+            draft_id=draft_id,
+            expected_revision=revision,
+            reviewer_id=reviewer,
+            notes=notes,
+        )
+        console.print(
+            f"[bold green]Draft '{draft_id}' successfully APPROVED on revision v{event.reviewed_revision}.[/bold green]"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Approval failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@review_app.command("reject")
+def review_reject(
+    draft_id: str = typer.Argument(..., help="Draft identifier to reject"),
+    reason: str = typer.Option(..., "--reason", help="Mandatory reason code: HALLUCINATION, TONE_MISMATCH, WRONG_CAPABILITY, TIMING_IRRELEVANCE, INSUFFICIENT_PERSONALIZATION, OTHER"),
+    revision: int = typer.Option(..., "--revision", "-r", help="Expected current revision number (CAS check)"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="Reviewer identifier"),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Optional rejection commentary"),
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """Reject an outreach draft with a mandatory structured reason code."""
+    from src.email_generation.review_models import RejectionReason
+    service = _get_review_service(db_path)
+    try:
+        reason_enum = RejectionReason(reason.upper())
+    except ValueError:
+        valid_reasons = ", ".join([r.value for r in RejectionReason])
+        console.print(f"[bold red]Invalid reason code:[/bold red] '{reason}'. Must be one of: {valid_reasons}")
+        raise typer.Exit(1)
+
+    try:
+        event = service.reject_draft(
+            draft_id=draft_id,
+            expected_revision=revision,
+            reason_code=reason_enum,
+            reviewer_id=reviewer,
+            notes=notes,
+        )
+        console.print(
+            f"[bold yellow]Draft '{draft_id}' REJECTED on revision v{event.reviewed_revision} "
+            f"due to {event.reason_code.value}.[/bold yellow]"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Rejection failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@review_app.command("edit")
+def review_edit(
+    draft_id: str = typer.Argument(..., help="Draft identifier to edit"),
+    subject: str = typer.Option(..., "--subject", "-s", help="New subject line"),
+    body: str = typer.Option(..., "--body", "-b", help="New body copy"),
+    revision: int = typer.Option(..., "--revision", "-r", help="Expected current revision number (CAS check)"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="Reviewer/editor identifier"),
+    notes: Optional[str] = typer.Option(None, "--notes", help="Optional edit commentary"),
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """Edit draft subject/body, incrementing revision and logging edit distance metrics."""
+    service = _get_review_service(db_path)
+    try:
+        event = service.edit_draft(
+            draft_id=draft_id,
+            new_subject=subject,
+            new_body=body,
+            expected_revision=revision,
+            reviewer_id=reviewer,
+            notes=notes,
+        )
+        console.print(
+            f"[bold green]Draft '{draft_id}' successfully updated from revision v{event.reviewed_revision} "
+            f"to v{event.resulting_revision}.[/bold green]\n"
+            f"[cyan]Char Edit Distance:[/cyan] {event.char_edit_distance} (Ratio: {event.normalized_char_ratio})\n"
+            f"[cyan]Word Edit Distance:[/cyan] {event.word_edit_distance} (Ratio: {event.normalized_word_ratio})"
+        )
+    except Exception as e:
+        console.print(f"[bold red]Edit failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@review_app.command("telemetry")
+def review_telemetry(
+    db_path: Optional[str] = typer.Option(None, "--db-path", help="Custom SQLite database path"),
+):
+    """Display review telemetry summary, approval/rejection rates, edit distances, and reviewer metrics."""
+    service = _get_review_service(db_path)
+    t = service.get_telemetry()
+
+    summary_table = Table(title="Human Review Decision Telemetry", border_style="cyan")
+    summary_table.add_column("Metric", style="bold")
+    summary_table.add_column("Value")
+
+    summary_table.add_row("Total Drafts Reviewed", str(t.total_drafts_reviewed))
+    summary_table.add_row("Total Review Events", str(t.total_review_events))
+    summary_table.add_row("Final Decisions (Approved + Rejected)", str(t.final_decision_drafts_count))
+    summary_table.add_row("Approved Drafts", f"[green]{t.approved_count}[/green]")
+    summary_table.add_row("Rejected Drafts", f"[red]{t.rejected_count}[/red]")
+    summary_table.add_row("Approval Rate", f"{t.approval_rate * 100:.1f}%")
+    summary_table.add_row("Rejection Rate", f"{t.rejection_rate * 100:.1f}%")
+    summary_table.add_row("Drafts with >= 1 Edit", str(t.drafts_with_edits_count))
+    summary_table.add_row("Edit Frequency", f"{t.edit_frequency * 100:.1f}%")
+    summary_table.add_row("Percentile Method", t.percentile_method)
+    console.print(summary_table)
+
+    # Edit distance stats
+    eds = t.edit_distance_stats
+    dist_table = Table(title="Edit Distance Statistics (Over EDITED Events)", border_style="blue")
+    dist_table.add_column("Metric", style="bold")
+    dist_table.add_column("Mean")
+    dist_table.add_column("Median (p50)")
+    dist_table.add_column("90th Percentile (p90)")
+
+    dist_table.add_row("Char Distance", f"{eds.mean_char_distance:.2f}", f"{eds.median_char_distance:.2f}", f"{eds.p90_char_distance:.2f}")
+    dist_table.add_row("Word Distance", f"{eds.mean_word_distance:.2f}", f"{eds.median_word_distance:.2f}", f"{eds.p90_word_distance:.2f}")
+    dist_table.add_row("Normalized Char Ratio", f"{eds.mean_normalized_char_ratio:.4f}", f"{eds.median_normalized_char_ratio:.4f}", f"{eds.p90_normalized_char_ratio:.4f}")
+    dist_table.add_row("Normalized Word Ratio", f"{eds.mean_normalized_word_ratio:.4f}", f"{eds.median_normalized_word_ratio:.4f}", f"{eds.p90_normalized_word_ratio:.4f}")
+    console.print(dist_table)
+
+    # Rejection Breakdown
+    if t.rejection_reasons_breakdown:
+        rej_table = Table(title="Rejection Reasons Breakdown", border_style="yellow")
+        rej_table.add_column("Reason Code", style="bold yellow")
+        rej_table.add_column("Count", justify="right")
+        for reason, count in sorted(t.rejection_reasons_breakdown.items()):
+            rej_table.add_row(reason, str(count))
+        console.print(rej_table)
+
+    # Reviewer Activity
+    if t.reviewer_activity:
+        act_table = Table(title="Reviewer Activity Breakdown", border_style="magenta")
+        act_table.add_column("Reviewer ID", style="bold magenta")
+        act_table.add_column("Total Actions", justify="right")
+        act_table.add_column("Approvals", justify="right")
+        act_table.add_column("Rejections", justify="right")
+        act_table.add_column("Edits", justify="right")
+        for r_id, act in sorted(t.reviewer_activity.items()):
+            act_table.add_row(r_id, str(act.total_actions), str(act.approvals), str(act.rejections), str(act.edits))
+        console.print(act_table)
 
 
 if __name__ == "__main__":

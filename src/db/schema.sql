@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS outreach_drafts (
     human_review_status   TEXT NOT NULL DEFAULT 'pending_review'
         CHECK (human_review_status IN ('pending_review', 'approved', 'rejected', 'needs_revision')),
     reviewer_notes        TEXT,
+    current_revision      INTEGER NOT NULL DEFAULT 1,
     created_at            TEXT NOT NULL,
     deleted_at            TEXT
 );
@@ -107,15 +108,65 @@ CREATE INDEX IF NOT EXISTS idx_outreach_drafts_context ON outreach_drafts(contex
 CREATE INDEX IF NOT EXISTS idx_outreach_drafts_session ON outreach_drafts(research_session_id);
 
 CREATE TABLE IF NOT EXISTS human_review_events (
-    event_id    TEXT PRIMARY KEY,
-    draft_id    TEXT NOT NULL REFERENCES outreach_drafts(draft_id) ON DELETE CASCADE,
-    decision    TEXT NOT NULL
-        CHECK (decision IN ('approved', 'rejected', 'needs_revision')),
-    reviewer_id TEXT,
-    notes       TEXT,
-    decided_at  TEXT NOT NULL
+    event_id              TEXT PRIMARY KEY,
+    draft_id              TEXT NOT NULL REFERENCES outreach_drafts(draft_id) ON DELETE CASCADE,
+    action                TEXT NOT NULL DEFAULT 'APPROVED'
+        CHECK (action IN ('APPROVED', 'REJECTED', 'EDITED')),
+    decision              TEXT,
+    reviewed_revision     INTEGER NOT NULL DEFAULT 1,
+    resulting_revision    INTEGER NOT NULL DEFAULT 1,
+    reviewer_id           TEXT,
+    notes                 TEXT,
+    reason_code           TEXT
+        CHECK (reason_code IS NULL OR reason_code IN ('HALLUCINATION', 'TONE_MISMATCH', 'WRONG_CAPABILITY', 'TIMING_IRRELEVANCE', 'INSUFFICIENT_PERSONALIZATION', 'OTHER')),
+    original_subject      TEXT,
+    original_body         TEXT,
+    resulting_subject     TEXT,
+    resulting_body        TEXT,
+    char_edit_distance    INTEGER,
+    word_edit_distance    INTEGER,
+    normalized_char_ratio REAL,
+    normalized_word_ratio REAL,
+    decided_at            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_human_review_events_draft ON human_review_events(draft_id);
+CREATE INDEX IF NOT EXISTS idx_human_review_events_action ON human_review_events(action);
+CREATE INDEX IF NOT EXISTS idx_human_review_events_decided ON human_review_events(decided_at);
+
+-- Triggers enforcing append-only immutability at the persistence layer
+CREATE TRIGGER IF NOT EXISTS prevent_human_review_events_update
+BEFORE UPDATE ON human_review_events
+BEGIN
+    SELECT RAISE(ABORT, 'human_review_events is append-only; updates are not permitted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_human_review_events_delete
+BEFORE DELETE ON human_review_events
+BEGIN
+    SELECT RAISE(ABORT, 'human_review_events is append-only; deletions are not permitted');
+END;
+
+-- Read-only view for review events query interface
+CREATE VIEW IF NOT EXISTS review_events AS
+SELECT
+    event_id,
+    draft_id,
+    action,
+    reviewed_revision,
+    resulting_revision,
+    reviewer_id,
+    notes,
+    reason_code,
+    original_subject,
+    original_body,
+    resulting_subject,
+    resulting_body,
+    char_edit_distance,
+    word_edit_distance,
+    normalized_char_ratio,
+    normalized_word_ratio,
+    decided_at AS timestamp
+FROM human_review_events;
 
 -- ============================================================================
 -- 3. Research Sessions & Execution Plan
