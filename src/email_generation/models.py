@@ -5,8 +5,9 @@ from enum import Enum
 from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.common.provenance import OutputProvenance
 from src.researcher.models import ResearchPackage, VerificationStatus
-from src.signal_strategy.models import OutreachStrategy
+from src.signal_strategy.models import CTAType, OutreachStrategy
 
 
 
@@ -23,6 +24,45 @@ class HumanReviewStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     NEEDS_REVISION = "needs_revision"
+
+
+class LinterSeverity(str, Enum):
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+
+class LinterFinding(BaseModel):
+    """An individual finding from the deterministic readability and quality linter."""
+
+    model_config = ConfigDict(frozen=True)
+
+    rule_id: str = Field(description="Unique identifier for the linter rule")
+    severity: LinterSeverity = Field(description="Severity level of the finding")
+    explanation: str = Field(description="Human-readable explanation of the issue")
+    location: Optional[str] = Field(default=None, description="Relevant text excerpt or location in draft")
+
+
+class LinterResult(BaseModel):
+    """Consolidated outcome of the deterministic readability and email-quality linter."""
+
+    model_config = ConfigDict(frozen=True)
+
+    passed: bool = Field(description="True if no ERROR severity findings are present")
+    findings: List[LinterFinding] = Field(default_factory=list, description="All linter findings")
+    word_count: int = Field(ge=0, description="Total word count analyzed")
+    sentence_count: int = Field(ge=0, description="Total sentence count analyzed")
+    paragraph_count: int = Field(ge=0, description="Total paragraph count analyzed")
+    flesch_kincaid_grade: Optional[float] = Field(default=None, description="Computed Flesch-Kincaid readability grade")
+    has_errors: bool = Field(default=False, description="True if any findings have severity ERROR")
+    has_warnings: bool = Field(default=False, description="True if any findings have severity WARNING")
+
+
+class RawEmailDraftOutput(BaseModel):
+    """Pydantic model for structured LLM decoding of email drafts."""
+
+    subject: str = Field(description="Subject line of the cold outreach email")
+    body: str = Field(description="Plain text body of the cold outreach email")
 
 
 class AtomicClaim(BaseModel):
@@ -94,9 +134,11 @@ class EmailDraft(BaseModel):
 
 
 class VerifiedOutreachDraft(BaseModel):
-    """Complete, verified outreach draft contract for human review.
+    """Complete outreach draft contract for human review.
     
-    Includes full provenance back to source evidence and explicit review flags.
+    Contains the generated and linted email draft, strategy alignment, selected CTA,
+    and linter results. In M1.4, semantic claim verification (M1.5) has not yet been performed.
+    Class name is preserved for backward compatibility across downstream modules.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -104,16 +146,35 @@ class VerifiedOutreachDraft(BaseModel):
     draft_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     draft: EmailDraft
     claim_verifications: List[ClaimVerification] = Field(
+        default_factory=list,
         description="Verification results for all claims in the draft",
     )
-    quality_evaluation: QualityEvaluation = Field(
+    quality_evaluation: Optional[QualityEvaluation] = Field(
+        default=None,
         description="Rubric evaluation across 7 dimensions",
     )
-    research_package: ResearchPackage = Field(
+    research_package: Optional[ResearchPackage] = Field(
+        default=None,
         description="Full research package providing complete evidence provenance",
     )
     outreach_strategy: OutreachStrategy = Field(
         description="Strategy blueprint that guided this draft",
+    )
+    linter_result: Optional[LinterResult] = Field(
+        default=None,
+        description="Authoritative outcome and findings of the readability and quality linter",
+    )
+    selected_cta: Optional[CTAType] = Field(
+        default=None,
+        description="Authoritative CTA type selected from strategy",
+    )
+    cta_text: Optional[str] = Field(
+        default=None,
+        description="Exact CTA sentence or closing inquiry used in draft",
+    )
+    provenance: Optional[OutputProvenance] = Field(
+        default=None,
+        description="Generation and linting provenance metadata",
     )
     generation_attempts: int = Field(default=1, ge=1)
     human_review_status: HumanReviewStatus = Field(

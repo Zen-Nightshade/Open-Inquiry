@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional
 
 from src.context.models import OutreachContext, ProductContext, ProspectContext
 from src.db.state_store import StateStore
+from src.email_generation.generator import EmailGenerationError
+from src.email_generation.models import VerifiedOutreachDraft
+from src.email_generation.service import DraftPersistenceError, EmailGenerationService
 from src.researcher.models import ResearchPackage, ResolutionStatus
 from src.researcher.orchestration.orchestrator import Researcher
 from src.signal_strategy.models import StrategyResult
@@ -22,11 +25,17 @@ from .models import (
     StageStatus,
 )
 
+from src.generator.observability import (
+    active_job_id,
+    active_run_id as ctx_run_id,
+    active_stage_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class ApplicationOrchestrator:
-    """Top-level application orchestrator governing the end-to-end Zamp outreach pipeline.
+    """Top-level application orchestrator governing the end-to-end Open Inquiry outreach pipeline.
     
     Responsibilities:
       - Validates domain contexts and inputs.
@@ -34,7 +43,8 @@ class ApplicationOrchestrator:
       - Executes multi-turn research via the Researcher orchestrator without holding DB locks.
       - Enforces Phase F epistemic sufficiency gating (distinguishing facts from sufficient research).
       - Executes commercial signal identification and strategy formulation via SignalStrategyService.
-      - Persists final strategy blueprints and stage execution records for audit and explainability.
+      - Executes operational email draft generation and readability linting via EmailGenerationService.
+      - Persists final strategy blueprints, email drafts in PENDING_REVIEW, and stage execution records for audit.
       - Supports run retrieval, stage inspection, and deep evidence provenance after process restart.
     """
 
@@ -43,10 +53,12 @@ class ApplicationOrchestrator:
         state_store: StateStore,
         researcher: Optional[Researcher] = None,
         strategy_service: Optional[SignalStrategyService] = None,
+        email_service: Optional[EmailGenerationService] = None,
     ) -> None:
         self.state_store = state_store
         self.researcher = researcher or Researcher(state_store=self.state_store)
         self.strategy_service = strategy_service or SignalStrategyService()
+        self.email_service = email_service or EmailGenerationService(state_store=self.state_store)
 
     def run(
         self,
@@ -66,15 +78,15 @@ class ApplicationOrchestrator:
         elif not db_status["is_initialized"] or not db_status["is_schema_valid"]:
             raise RuntimeError(
                 f"Database at {db_status['db_path']} has an incompatible schema: {db_status['incompatibility_details']}. "
-                f"Per Zamp manual reset policy, back up your data if needed, delete the database file, and run 'zamp db init'."
+                f"Per Open Inquiry manual reset policy, back up your data if needed, delete the database file, and run 'open-inquiry db init'."
             )
 
         active_run_id = run_id or str(uuid.uuid4())
         existing_run = self.state_store.get_run(active_run_id) if run_id else None
 
         if existing_run:
-            job_id = existing_run.get("job_id") or f"job-{active_run_id[:8]}"
-            session_id = existing_run.get("research_session_id") or f"session-{active_run_id[:8]}"
+            job_id = existing_run.get("job_id") or f"job_{uuid.uuid4().hex}"
+            session_id = existing_run.get("research_session_id") or f"session_{uuid.uuid4().hex}"
             context_id = existing_run.get("context_id") or str(uuid.uuid4())
             prospect_id = existing_run["prospect_id"]
             if existing_run.get("stage_statuses_json"):
@@ -86,10 +98,15 @@ class ApplicationOrchestrator:
             else:
                 stage_records = []
         else:
-            job_id = f"job-{active_run_id[:8]}"
-            session_id = f"session-{active_run_id[:8]}"
+            job_id = f"job_{uuid.uuid4().hex}"
+            session_id = f"session_{uuid.uuid4().hex}"
             context_id = str(uuid.uuid4())
             stage_records = []
+
+        # Propagate observability context variables
+        ctx_run_id.set(active_run_id)
+        active_job_id.set(job_id)
+        active_stage_name.set(StageIdentifier.VALIDATION.value)
 
         warnings: List[str] = []
 
@@ -104,6 +121,7 @@ class ApplicationOrchestrator:
             details: Optional[Dict[str, Any]] = None,
             error_message: Optional[str] = None,
         ) -> StageExecutionRecord:
+            active_stage_name.set(stage.value)
             completed_at = datetime.now(timezone.utc).isoformat()
             t0 = datetime.fromisoformat(started_at)
             t1 = datetime.fromisoformat(completed_at)
@@ -280,6 +298,12 @@ class ApplicationOrchestrator:
                     started_at=s_start,
                     details={"gate_decision": "halt", "reason": reason},
                 )
+                record_stage(
+                    stage=StageIdentifier.EMAIL_GENERATION,
+                    status=StageStatus.SKIPPED,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    details={"reason": f"Skipped due to insufficient research: {reason}"},
+                )
                 return self._finalize_run(
                     run_id=active_run_id,
                     job_id=job_id,
@@ -314,6 +338,12 @@ class ApplicationOrchestrator:
                         started_at=s_start,
                         details={"gate_decision": "halt", "reason": reason},
                     )
+                    record_stage(
+                        stage=StageIdentifier.EMAIL_GENERATION,
+                        status=StageStatus.SKIPPED,
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        details={"reason": f"Skipped due to unresolved identity: {reason}"},
+                    )
                     return self._finalize_run(
                         run_id=active_run_id,
                         job_id=job_id,
@@ -345,6 +375,12 @@ class ApplicationOrchestrator:
                         status=StageStatus.FAILED,
                         started_at=s_start,
                         details={"gate_decision": "halt", "reason": reason, "missing": research_package.missing_information},
+                    )
+                    record_stage(
+                        stage=StageIdentifier.EMAIL_GENERATION,
+                        status=StageStatus.SKIPPED,
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        details={"reason": f"Skipped due to insufficient research: {reason}"},
                     )
                     return self._finalize_run(
                         run_id=active_run_id,
@@ -402,16 +438,95 @@ class ApplicationOrchestrator:
             )
 
             # =========================================================================
-            # Stage 6: Strategy Viability Check & Status Determination
+            # Stage 6: Strategy Viability Check & Email Generation
             # =========================================================================
+            draft: Optional[VerifiedOutreachDraft] = None
+            email_stage_err: Optional[str] = None
+            email_stage_status = StageStatus.COMPLETED
+
             if not strategy_result.is_viable:
                 rejection = strategy_result.rejection_reason or "No viable commercial signal identified."
                 warnings.extend(strategy_result.unviable_reasons)
                 final_status = RunStatus.NO_VIABLE_SIGNAL
-            elif had_sufficiency_warning:
-                final_status = RunStatus.COMPLETED_WITH_WARNINGS
+                record_stage(
+                    stage=StageIdentifier.EMAIL_GENERATION,
+                    status=StageStatus.SKIPPED,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    details={"reason": f"Skipped: {rejection}"},
+                )
+            elif not strategy_result.strategy:
+                rejection = "StrategyResult contains no strategy."
+                final_status = RunStatus.NO_VIABLE_SIGNAL
+                record_stage(
+                    stage=StageIdentifier.EMAIL_GENERATION,
+                    status=StageStatus.SKIPPED,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    details={"reason": f"Skipped: {rejection}"},
+                )
+            elif not getattr(strategy_result.strategy, "toulmin_argument", None):
+                # Missing Toulmin argument: SKIPPED with explicit reason per compatibility policy
+                skip_msg = "OutreachStrategy lacks validated ToulminArgument per M1.3 contract."
+                record_stage(
+                    stage=StageIdentifier.EMAIL_GENERATION,
+                    status=StageStatus.SKIPPED,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    details={"reason": skip_msg},
+                )
+                final_status = RunStatus.COMPLETED_WITH_WARNINGS if had_sufficiency_warning else RunStatus.COMPLETED
             else:
-                final_status = RunStatus.COMPLETED
+                # =========================================================================
+                # Stage 7: Email Generation & Readability Linting
+                # =========================================================================
+                current_stage = StageIdentifier.EMAIL_GENERATION
+                s_start = datetime.now(timezone.utc).isoformat()
+                email_details: Dict[str, Any] = {}
+
+                try:
+                    draft = self.email_service.generate_draft(
+                        prospect=prospect,
+                        product=product,
+                        strategy_result=strategy_result,
+                        outreach=outreach,
+                        research_package=research_package,
+                        context_id=context_id,
+                        research_session_id=session_id,
+                    )
+                    email_details = {
+                        "draft_id": draft.draft_id,
+                        "word_count": draft.draft.word_count,
+                        "linter_passed": draft.linter_result.passed if draft.linter_result else None,
+                        "human_review_status": draft.human_review_status.value,
+                    }
+                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings):
+                        final_status = RunStatus.COMPLETED_WITH_WARNINGS
+                    else:
+                        final_status = RunStatus.COMPLETED
+                except DraftPersistenceError as p_err:
+                    logger.error("Draft persistence failed: %s", p_err)
+                    email_stage_status = StageStatus.FAILED
+                    email_stage_err = str(p_err)
+                    final_status = RunStatus.FAILED
+                    warnings.append(f"Draft persistence failed: {p_err}")
+                except EmailGenerationError as g_err:
+                    logger.error("Email generation failed: %s", g_err)
+                    email_stage_status = StageStatus.FAILED
+                    email_stage_err = str(g_err)
+                    final_status = RunStatus.FAILED
+                    warnings.append(f"Email generator failed: {g_err}")
+                except Exception as e_err:
+                    logger.error("Email generation unexpected failure: %s", e_err)
+                    email_stage_status = StageStatus.FAILED
+                    email_stage_err = str(e_err)
+                    final_status = RunStatus.FAILED
+                    warnings.append(f"Email generation failed: {e_err}")
+
+                record_stage(
+                    stage=StageIdentifier.EMAIL_GENERATION,
+                    status=email_stage_status,
+                    started_at=s_start,
+                    details=email_details,
+                    error_message=email_stage_err,
+                )
 
             return self._finalize_run(
                 run_id=active_run_id,
@@ -423,9 +538,10 @@ class ApplicationOrchestrator:
                 research_session_id=session_id,
                 research_package=research_package,
                 strategy_result=strategy_result,
+                draft=draft,
                 stage_records=stage_records,
                 warnings=warnings,
-                error_message=strategy_result.rejection_reason if not strategy_result.is_viable else None,
+                error_message=email_stage_err if (email_stage_status == StageStatus.FAILED) else (strategy_result.rejection_reason if not strategy_result.is_viable else None),
                 started_at=start_time_iso,
             )
 
@@ -447,6 +563,7 @@ class ApplicationOrchestrator:
                 research_session_id=session_id,
                 research_package=None,
                 strategy_result=None,
+                draft=None,
                 stage_records=stage_records,
                 warnings=warnings,
                 error_message=str(exc),
@@ -468,12 +585,14 @@ class ApplicationOrchestrator:
         warnings: List[str],
         error_message: Optional[str],
         started_at: str,
+        draft: Optional[VerifiedOutreachDraft] = None,
     ) -> RunResult:
         """Atomically persist run completion state, update job record, and return RunResult."""
         completed_at_iso = datetime.now(timezone.utc).isoformat()
         stages_json = json.dumps([rec.model_dump() for rec in stage_records])
         warnings_json = json.dumps(warnings) if warnings else None
         strat_json = strategy_result.model_dump_json() if strategy_result else None
+        draft_id = draft.draft_id if draft else None
 
         # 1. Update application_runs row
         self.state_store.update_run(
@@ -485,6 +604,7 @@ class ApplicationOrchestrator:
             warnings_json=warnings_json,
             error_message=error_message,
             completed_at=completed_at_iso,
+            draft_id=draft_id,
         )
 
         # 2. Update jobs table
@@ -509,6 +629,8 @@ class ApplicationOrchestrator:
             research_session_id=research_session_id,
             research_package=research_package,
             strategy_result=strategy_result,
+            draft=draft,
+            draft_id=draft_id,
             stage_records=stage_records,
             warnings=warnings,
             error_message=error_message,
@@ -539,6 +661,7 @@ class ApplicationOrchestrator:
             prospect_id=row["prospect_id"],
             context_id=row.get("context_id"),
             research_session_id=row.get("research_session_id"),
+            draft_id=row.get("draft_id"),
             status=RunStatus(row["status"]),
             prospect=prospect,
             product=product,
@@ -640,10 +763,14 @@ class ApplicationOrchestrator:
             raise ValueError("Product product_name and value_proposition are required.")
 
         active_run_id = run_id or str(uuid.uuid4())
-        job_id = f"job-{active_run_id[:8]}"
-        session_id = f"session-{active_run_id[:8]}"
+        job_id = f"job_{uuid.uuid4().hex}"
+        session_id = f"session_{uuid.uuid4().hex}"
         context_id = str(uuid.uuid4())
         start_time_iso = datetime.now(timezone.utc).isoformat()
+
+        ctx_run_id.set(active_run_id)
+        active_job_id.set(job_id)
+        active_stage_name.set(StageIdentifier.VALIDATION.value)
 
         prospect_id = self.state_store.save_prospect(prospect)
         version_id = self.state_store.save_product_context(product)

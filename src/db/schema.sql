@@ -1,4 +1,4 @@
--- Zamp Single Authoritative Database Schema
+-- Open Inquiry Single Authoritative Database Schema
 -- Defines all 36 core domain tables in topological order respecting referential integrity.
 -- PRAGMA foreign_keys = ON must be active when executing or using this database.
 
@@ -33,17 +33,24 @@ CREATE INDEX IF NOT EXISTS idx_job_attempts_job ON job_attempts(job_id);
 
 CREATE TABLE IF NOT EXISTS model_executions (
     execution_id  TEXT PRIMARY KEY,
+    run_id        TEXT,
     job_id        TEXT REFERENCES jobs(job_id) ON DELETE SET NULL,
+    stage_name    TEXT,
+    task_type     TEXT NOT NULL,
     provider      TEXT NOT NULL,
     model_name    TEXT NOT NULL,
-    task_type     TEXT NOT NULL,
     prompt_hash   TEXT NOT NULL,
     input_tokens  INTEGER,
     output_tokens INTEGER,
     duration_ms   REAL,
+    status        TEXT NOT NULL DEFAULT 'completed',
+    error_type    TEXT,
+    error_message TEXT,
+    attempt_num   INTEGER NOT NULL DEFAULT 1,
     executed_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_model_executions_job ON model_executions(job_id);
+CREATE INDEX IF NOT EXISTS idx_model_executions_run ON model_executions(run_id);
 
 -- ============================================================================
 -- 2. Prospects, Product Contexts & Outreach
@@ -470,6 +477,7 @@ CREATE TABLE IF NOT EXISTS application_runs (
     prospect_id             TEXT REFERENCES prospects(prospect_id) ON DELETE CASCADE,
     context_id              TEXT REFERENCES outreach_contexts(context_id) ON DELETE SET NULL,
     research_session_id     TEXT REFERENCES research_sessions(session_id) ON DELETE SET NULL,
+    draft_id                TEXT REFERENCES outreach_drafts(draft_id) ON DELETE SET NULL,
     status                  TEXT NOT NULL
         CHECK (status IN (
             'pending',

@@ -20,19 +20,13 @@ PathLike = Union[str, Path]
 
 class StateStore:
     """Composition facade providing high-level coordinated database operations.
-    
+
     Ensures that every operation runs within explicit, short UnitOfWork transactions.
     """
 
     def __init__(self, db_path: Optional[PathLike] = None) -> None:
-        if db_path is not None:
-            if str(db_path) == ":memory:":
-                self.db_path = ":memory:"
-            else:
-                p = Path(db_path)
-                self.db_path = p.resolve() if p.is_absolute() else (REPO_ROOT / p).resolve()
-        else:
-            self.db_path = get_db_path()
+        resolved = get_db_path(db_path)
+        self.db_path = ":memory:" if str(resolved) == ":memory:" else resolved
 
     def initialize(self) -> None:
         """Initialize database schema directly from schema.sql. Idempotent."""
@@ -157,6 +151,18 @@ class StateStore:
         with self.uow() as uow:
             return uow.products.get_product_version(version_id)
 
+    def get_product_context(self, version_id: str) -> Optional[ProductContext]:
+        """Retrieve and deserialize a ProductContext (including structured contract) by version ID."""
+        row = self.get_product_version(version_id)
+        if not row or not row.get("snapshot_json"):
+            return None
+        return ProductContext.model_validate_json(row["snapshot_json"])
+
+    def get_latest_version_for_product(self, product_name: str) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest product version snapshot by product name."""
+        with self.uow() as uow:
+            return uow.products.get_latest_version_for_product(product_name)
+
     def save_outreach_context(
         self,
         outreach: OutreachContext,
@@ -233,6 +239,7 @@ class StateStore:
         warnings_json: Optional[str] = None,
         error_message: Optional[str] = None,
         completed_at: Optional[str] = None,
+        draft_id: Optional[str] = None,
     ) -> bool:
         """Update an application run."""
         with self.uow() as uow:
@@ -246,6 +253,7 @@ class StateStore:
                 warnings_json=warnings_json,
                 error_message=error_message,
                 completed_at=completed_at,
+                draft_id=draft_id,
             )
 
     def list_runs(
@@ -257,3 +265,16 @@ class StateStore:
         with self.uow() as uow:
             return uow.runs.list_runs(limit=limit, status=status)
 
+    def record_model_execution(self, **kwargs) -> Dict[str, Any]:
+        """Record a model execution record."""
+        with self.uow() as uow:
+            return uow.jobs.record_model_execution(**kwargs)
+
+    def get_model_executions(
+        self,
+        job_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve model executions for a job or run."""
+        with self.uow() as uow:
+            return uow.jobs.get_model_executions(job_id=job_id, run_id=run_id)

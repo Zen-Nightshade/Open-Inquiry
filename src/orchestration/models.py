@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.context.models import OutreachContext, ProductContext, ProspectContext
+from src.email_generation.models import VerifiedOutreachDraft
 from src.researcher.models import ResearchPackage
 from src.signal_strategy.models import StrategyResult
 
@@ -25,6 +26,7 @@ class StageIdentifier(str, Enum):
     RESEARCH = "research"
     SUFFICIENCY_GATE = "sufficiency_gate"
     SIGNAL_STRATEGY = "signal_strategy"
+    EMAIL_GENERATION = "email_generation"
     FINALIZATION = "finalization"
 
 
@@ -60,6 +62,7 @@ class ApplicationRunSnapshot(BaseModel):
     prospect_id: str
     context_id: Optional[str] = None
     research_session_id: Optional[str] = None
+    draft_id: Optional[str] = None
     status: RunStatus
     prospect: ProspectContext
     product: ProductContext
@@ -85,6 +88,8 @@ class RunResult(BaseModel):
     research_session_id: Optional[str] = None
     research_package: Optional[ResearchPackage] = None
     strategy_result: Optional[StrategyResult] = None
+    draft: Optional[VerifiedOutreachDraft] = None
+    draft_id: Optional[str] = None
     stage_records: List[StageExecutionRecord] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     error_message: Optional[str] = None

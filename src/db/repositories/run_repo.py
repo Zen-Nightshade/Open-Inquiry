@@ -79,6 +79,7 @@ class RunRepository:
         warnings_json: Optional[str] = None,
         error_message: Optional[str] = None,
         completed_at: Optional[str] = None,
+        draft_id: Optional[str] = None,
     ) -> bool:
         """Update fields on an existing application run record."""
         assignments: List[str] = []
@@ -93,6 +94,9 @@ class RunRepository:
         if context_id is not None:
             assignments.append("context_id = ?")
             params.append(context_id)
+        if draft_id is not None:
+            assignments.append("draft_id = ?")
+            params.append(draft_id)
         if strategy_result_json is not None:
             assignments.append("strategy_result_json = ?")
             params.append(strategy_result_json)
