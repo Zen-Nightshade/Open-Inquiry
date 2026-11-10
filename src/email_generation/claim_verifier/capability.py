@@ -162,8 +162,8 @@ class ProductCapabilityBoundsGate:
                     results.append(
                         CapabilityCheckResult(
                             claim_id=claim.claim_id,
-                            is_whitelisted=True,
-                            is_precondition_satisfied=True,
+                            is_whitelisted=False,
+                            is_precondition_satisfied=False,
                             violates_exclusion=False,
                             rationale=reason,
                         )
@@ -235,9 +235,6 @@ class ProductCapabilityBoundsGate:
                 return target_cap
             if any(any(w in claim_lower for w in prob.lower().split() if len(w) > 3) for prob in target_cap.target_operational_problems):
                 return target_cap
-            # If claim references product name and mentions target capability domain
-            if contract.product_name and contract.product_name.lower() in claim_lower:
-                return target_cap
 
         # Direct name match or word overlap
         for cap in contract.capabilities:
@@ -258,13 +255,5 @@ class ProductCapabilityBoundsGate:
             for pp in cap.verified_proof_points:
                 if any(word in claim_lower for word in pp.lower().split() if len(word) > 4):
                     return cap
-
-        # If single capability in contract and claim mentions product name or value proposition
-        if len(contract.capabilities) == 1:
-            if contract.product_name and contract.product_name.lower() in claim_lower:
-                return contract.capabilities[0]
-            val_prop_words = [w for w in re.findall(r"\w+", contract.value_proposition.lower()) if len(w) > 3]
-            if sum(1 for w in val_prop_words if w in claim_lower) >= 2:
-                return contract.capabilities[0]
 
         return None

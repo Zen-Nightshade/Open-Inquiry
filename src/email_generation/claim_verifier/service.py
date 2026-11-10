@@ -12,6 +12,7 @@ from src.email_generation.claim_verifier.models import (
     CapabilityCheckResult,
     DecomposedClaim,
     EntailmentCheckResult,
+    EntailmentVerdict,
     ModalityCheckResult,
     VerificationFinding,
     VerifierFindingSeverity,
@@ -119,12 +120,21 @@ class ClaimVerifierService:
             capability_results.extend(cap_res)
             all_findings.extend(cap_findings)
 
-            # Track unverified claims (claims associated with ERROR findings)
+            # Track unverified claims (claims associated with ERROR findings, NEUTRAL entailment, or unwhitelisted capabilities)
             error_claim_ids = {
                 f.claim_id for f in all_findings
                 if f.claim_id and f.severity == VerifierFindingSeverity.ERROR
             }
-            unverified_claim_ids.extend(list(error_claim_ids))
+            neutral_claim_ids = {
+                res.claim_id for res in entailment_results
+                if res.verdict == EntailmentVerdict.NEUTRAL
+            }
+            unwhitelisted_claim_ids = {
+                res.claim_id for res in capability_results
+                if not res.is_whitelisted or res.violates_exclusion
+            }
+            unverified_set = error_claim_ids | neutral_claim_ids | unwhitelisted_claim_ids
+            unverified_claim_ids.extend(sorted(list(unverified_set)))
 
         except Exception as exc:
             logger.error("Unexpected failure in ClaimVerifierService: %s", exc, exc_info=True)

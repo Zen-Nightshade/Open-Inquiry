@@ -112,6 +112,21 @@ def _make_dummy_product() -> ProductContext:
     )
 
 
+def _make_dummy_research_package() -> ResearchPackage:
+    ev = EvidenceRecord(
+        evidence_id="ev-101",
+        source_id="src-001",
+        verbatim_excerpt="Elena, saw your team added 10,000 new compute nodes at Black Mesa.",
+        confidence=ConfidenceLevel.HIGH,
+    )
+    fact = CanonicalFact(
+        fact_id="fact-101",
+        claim_text="saw your team added 10,000 new compute nodes at Black Mesa",
+        evidence_records=[ev],
+    )
+    return ResearchPackage(facts=(fact,), is_sufficient=True, is_complete=True)
+
+
 def _make_dummy_outreach() -> OutreachContext:
     return OutreachContext(
         objective="Initiate discovery conversation on cluster observability",
@@ -250,6 +265,7 @@ def test_service_generate_draft_happy_path_with_persistence():
             product=product,
             strategy_result=strat_res,
             outreach=outreach,
+            research_package=_make_dummy_research_package(),
         )
 
         assert isinstance(draft, VerifiedOutreachDraft)
@@ -357,11 +373,25 @@ def test_service_rewrite_policy_does_not_trigger_on_warnings_alone():
     generator = MockGenerator(outputs=[warn_draft])
     service = EmailGenerationService(generator=generator, linter=ReadabilityLinter())
 
+    pkg = ResearchPackage(facts=(
+        CanonicalFact(
+            fact_id="fact-101",
+            claim_text="recent cluster rollout at Black Mesa",
+            evidence_records=[EvidenceRecord(
+                evidence_id="ev-101",
+                source_id="src-1",
+                verbatim_excerpt="Elena, saw your recent cluster rollout.",
+                confidence=ConfidenceLevel.HIGH,
+            )],
+        ),
+    ), is_sufficient=True, is_complete=True)
+
     draft = service.generate_draft(
         prospect=_make_dummy_prospect(),
         product=_make_dummy_product(),
         strategy_result=_make_dummy_strategy_result(),
         outreach=_make_dummy_outreach(),
+        research_package=pkg,
     )
 
     # Should only call generator once because warnings alone do not trigger rewrite
@@ -656,6 +686,7 @@ def test_service_verifier_integration_populates_claim_verifications_and_quality_
             product=product,
             strategy_result=strat_res,
             outreach=outreach,
+            research_package=_make_dummy_research_package(),
         )
 
         assert isinstance(draft, VerifiedOutreachDraft)
@@ -702,6 +733,7 @@ def test_service_rewrite_triggered_by_verifier_error():
         product=_make_dummy_product(),
         strategy_result=_make_dummy_strategy_result(),
         outreach=_make_dummy_outreach(),
+        research_package=_make_dummy_research_package(),
     )
 
     # Verifier error triggered rewrite
@@ -750,6 +782,7 @@ def test_service_verifier_error_after_rewrite_preserves_draft_for_human_review()
         product=product,
         strategy_result=_make_dummy_strategy_result(),
         outreach=_make_dummy_outreach(),
+        research_package=_make_dummy_research_package(),
     )
 
     # Generator called twice (max 1 rewrite)

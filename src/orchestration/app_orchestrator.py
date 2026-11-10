@@ -496,12 +496,23 @@ class ApplicationOrchestrator:
                         "word_count": draft.draft.word_count,
                         "linter_passed": draft.linter_result.passed if draft.linter_result else None,
                         "verifier_passed": getattr(draft.verifier_result, "passed", None) if getattr(draft, "verifier_result", None) else None,
+                        "has_verifier_errors": getattr(draft.verifier_result, "has_errors", False) if getattr(draft, "verifier_result", None) else False,
+                        "verifier_errors_count": len([f for f in draft.verifier_result.findings if f.severity.value == "error"]) if getattr(draft, "verifier_result", None) else 0,
+                        "unverified_claim_ids": getattr(draft.verifier_result, "unverified_claim_ids", []) if getattr(draft, "verifier_result", None) else [],
                         "claim_verifications_count": len(draft.claim_verifications),
                         "human_review_status": draft.human_review_status.value,
                     }
                     has_verifier_warnings = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "has_warnings", False))
+                    has_verifier_errors = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "has_errors", False))
                     has_unverified_claims = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "unverified_claim_ids", []))
-                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings) or has_verifier_warnings or has_unverified_claims:
+                    verifier_passed = bool(getattr(draft.verifier_result, "passed", False)) if getattr(draft, "verifier_result", None) else True
+
+                    if has_verifier_errors:
+                        warnings.append(f"Draft verification produced {email_details['verifier_errors_count']} error finding(s). Requires human review.")
+                    if has_unverified_claims:
+                        warnings.append(f"Draft contains {len(email_details['unverified_claim_ids'])} unverified claim(s). Requires human review.")
+
+                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings) or has_verifier_warnings or has_verifier_errors or has_unverified_claims or not verifier_passed:
                         final_status = RunStatus.COMPLETED_WITH_WARNINGS
                     else:
                         final_status = RunStatus.COMPLETED

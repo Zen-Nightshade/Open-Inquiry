@@ -65,39 +65,20 @@ class FactEntailmentGate:
         results: List[EntailmentCheckResult] = []
         findings: List[VerificationFinding] = []
 
-        if (not research_package or not research_package.facts) and (toulmin_argument or strategy):
-            grounds_text = ""
-            if toulmin_argument and toulmin_argument.grounds and toulmin_argument.grounds.observed_event:
-                grounds_text += toulmin_argument.grounds.observed_event + ". "
-            if strategy and getattr(strategy, "primary_signal", None) and getattr(strategy.primary_signal, "signal", None):
-                sig = strategy.primary_signal.signal
-                grounds_text += f"{sig.label}. {sig.observed_event}. {sig.description}."
-            if not grounds_text and strategy:
-                grounds_text = strategy.central_message or ""
-
-            if grounds_text:
-                fact_id = (
-                    toulmin_argument.grounds.fact_ids[0]
-                    if (toulmin_argument and toulmin_argument.grounds and toulmin_argument.grounds.fact_ids)
-                    else "fact-grounds"
+        # Check if toulmin argument references fact IDs that are invalid / missing from research
+        if toulmin_argument and toulmin_argument.grounds and toulmin_argument.grounds.fact_ids:
+            known_fids = {f.fact_id for f in research_package.facts} if (research_package and research_package.facts) else set()
+            missing_toulmin_fids = [fid for fid in toulmin_argument.grounds.fact_ids if fid not in known_fids]
+            if missing_toulmin_fids:
+                findings.append(
+                    VerificationFinding(
+                        gate="FactEntailment",
+                        severity=VerifierFindingSeverity.ERROR,
+                        code="INVALID_FACT_REFERENCE",
+                        message=f"Toulmin argument referenced fact IDs not found in research package: {missing_toulmin_fids}",
+                        details={"missing_fact_ids": missing_toulmin_fids},
+                    )
                 )
-                conf = (
-                    toulmin_argument.grounds.composite_confidence
-                    if (toulmin_argument and toulmin_argument.grounds)
-                    else ConfidenceLevel.HIGH
-                )
-                ev = EvidenceRecord(
-                    evidence_id="ev-grounds",
-                    source_id="src-grounds",
-                    verbatim_excerpt=grounds_text,
-                    confidence=conf,
-                )
-                fact = CanonicalFact(
-                    fact_id=fact_id,
-                    claim_text=grounds_text,
-                    evidence_records=[ev],
-                )
-                research_package = ResearchPackage(facts=(fact,))
 
         if not research_package or not research_package.facts:
             # No research package available -> all prospect observations are unsupported
@@ -109,7 +90,7 @@ class FactEntailmentGate:
                         matched_fact_ids=[],
                         matched_evidence_ids=[],
                         confidence=0.0,
-                        rationale="No research facts available to verify prospect assertion.",
+                        rationale="No research facts available in research package to verify prospect assertion.",
                     )
                     results.append(res)
                     findings.append(
@@ -443,16 +424,19 @@ class FactEntailmentGate:
             overlap = claim_stems.intersection(fact_stems)
             nums_overlap = claim_nums.intersection(fact_nums)
 
-            # Match if:
-            # 1. Exact numerical metric matches + at least 1 keyword stem matches, OR
-            # 2. At least 2 keyword stems match, OR
-            # 3. >= 35% of claim keywords match
+            # Strict semantic entailment criteria:
+            # 1. Exact verbatim proposition substring match in fact or verbatim evidence excerpt, OR
+            # 2. For numerical claims: ALL numbers in the claim must be confirmed in fact/evidence AND at least 2 distinct semantic stems match, OR
+            # 3. For non-numerical claims: High semantic coverage (>= 70% of keywords and >= 3 stems)
+            # Raw lexical overlap (< 3 stems or < 70% overlap) is explicitly rejected as semantic entailment.
             is_match = False
-            if nums_overlap and len(overlap) >= 1:
+            claim_text_clean = re.sub(r"^(?:saw\s+your\s+team\s+|saw\s+you\s+|noticed\s+your\s+team\s+|noticed\s+)", "", claim.text.lower()).strip()
+            if claim_text_clean and claim_text_clean in all_fact_text.lower():
                 is_match = True
-            elif len(overlap) >= 2:
-                is_match = True
-            elif len(claim_keywords) > 0 and len(overlap) / len(claim_keywords) >= 0.35:
+            elif claim_nums:
+                if claim_nums.issubset(fact_nums) and len(overlap) >= 2:
+                    is_match = True
+            elif len(claim_keywords) >= 2 and len(overlap) >= 3 and (len(overlap) / len(claim_keywords)) >= 0.70:
                 is_match = True
 
             if is_match:
@@ -488,5 +472,5 @@ class FactEntailmentGate:
             matched_fact_ids=[],
             matched_evidence_ids=[],
             confidence=0.0,
-            rationale="Insufficient evidence corroborating prospect claim.",
+            rationale="Insufficient semantic evidence to entail prospect assertion; lexical overlap alone does not constitute entailment.",
         ), findings

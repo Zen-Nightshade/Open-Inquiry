@@ -261,12 +261,18 @@ class ClaimDecomposer:
         if text_lower.startswith(("if ", "assuming ", "depending on ", "when ", "as ")):
             return ClaimCategory.MODALITY_HEDGE, ModalityLevel.CONDITIONAL, True, is_product
 
-        # Determine materiality: subject headers without verbs or numerical metrics are non-material topic labels
+        # Determine materiality and relational inquiries in subject lines
         if section == ClaimSection.SUBJECT:
-            is_material = bool(re.search(
-                r"\b(?:\d+|is|are|was|were|have|has|had|saw|noticed|added|built|cut|reduced|raised|acquired|hiring|launched)\b",
-                text_lower,
+            # Check if the subject is an inquiry or conversational topic
+            if re.search(r"\b(?:inquiry|question|thoughts|touching base|quick question|intro|introduction|open inquiry)\b", text_lower):
+                # An inquiry header is a relational inquiry, not an assertive factual claim
+                return ClaimCategory.RELATIONAL_CTA, ModalityLevel.DIAGNOSTIC, False, is_product
+            # Check if this is a generic non-assertive subject phrase
+            is_generic = bool(re.match(
+                r"^(?:hello|hi|following up|outreach|partnership|collaboration)\s*[\?!:]?$",
+                text_lower.strip(),
             ))
+            is_material = not is_generic
         else:
             is_material = True
 
