@@ -333,6 +333,10 @@ class FactExtractor:
             )
 
             primary_date = parse_iso_date(raw_fact.primary_event_date) or valid_evidence_records[0].event_date
+            valid_from_val = raw_fact.primary_event_date or raw_fact.temporal_scope or (primary_date.isoformat() if primary_date else None)
+            from src.researcher.temporal import get_current_iso_timestamp, parse_partial_date
+            valid_from_str, _ = parse_partial_date(valid_from_val)
+            now_iso = get_current_iso_timestamp()
 
             fact_id = str(uuid.uuid4())
             canonical_fact = CanonicalFact(
@@ -343,6 +347,10 @@ class FactExtractor:
                 evidence_records=valid_evidence_records,
                 primary_event_date=primary_date,
                 composite_confidence=raw_fact.confidence,
+                valid_from=valid_from_str,
+                valid_to=None,
+                observed_at=now_iso,
+                recorded_at=now_iso,
                 provenance=OutputProvenance(
                     origin=ProvenanceOrigin.MODEL,
                     component="fact_extractor",
@@ -366,6 +374,10 @@ class FactExtractor:
                     evidence_records=canonical_fact.evidence_records,
                     primary_event_date=canonical_fact.primary_event_date,
                     composite_confidence=canonical_fact.composite_confidence,
+                    valid_from=canonical_fact.valid_from,
+                    valid_to=canonical_fact.valid_to,
+                    observed_at=canonical_fact.observed_at,
+                    recorded_at=canonical_fact.recorded_at,
                     provenance=canonical_fact.provenance,
                     molecular_facts=mol_facts,
                 )

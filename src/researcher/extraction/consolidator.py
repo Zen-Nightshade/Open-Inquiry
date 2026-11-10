@@ -15,6 +15,7 @@ from src.researcher.models import (
     FactCategory,
     ResearchAccumulator,
 )
+from src.researcher.temporal import is_temporally_sequential
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,10 @@ class FactConsolidator:
             diff_days = abs((fact_a.primary_event_date - fact_b.primary_event_date).days)
             if diff_days > 45:
                 return False
+
+        # Bitemporal validity check: sequential distinct dates are distinct historical assertions
+        if fact_a.valid_from and fact_b.valid_from and is_temporally_sequential(fact_a.valid_from, fact_b.valid_from):
+            return False
 
         # Text comparison
         text_a = fact_a.claim_text.lower().strip()

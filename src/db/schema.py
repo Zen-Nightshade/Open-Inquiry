@@ -158,6 +158,34 @@ def _ensure_canonical_facts_molecular_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_canonical_facts_bitemporal_columns(conn: sqlite3.Connection) -> None:
+    """Ensure newly added bitemporal columns exist on canonical_facts and backfill legacy rows idempotently."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(canonical_facts);")
+    cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if not cols:
+        return
+
+    columns_to_add = [
+        ("valid_from", "TEXT"),
+        ("valid_to", "TEXT"),
+        ("observed_at", "TEXT"),
+        ("recorded_at", "TEXT"),
+    ]
+    for col_name, col_def in columns_to_add:
+        if col_name not in cols:
+            conn.execute(f"ALTER TABLE canonical_facts ADD COLUMN {col_name} {col_def};")
+
+    # Idempotent backfill: populate recorded_at/observed_at from created_at and valid_from from primary_event_date
+    conn.execute("UPDATE canonical_facts SET recorded_at = created_at WHERE recorded_at IS NULL;")
+    conn.execute("UPDATE canonical_facts SET observed_at = created_at WHERE observed_at IS NULL;")
+    conn.execute("UPDATE canonical_facts SET valid_from = primary_event_date WHERE valid_from IS NULL AND primary_event_date IS NOT NULL;")
+
+    # Ensure index on bitemporal dimensions exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_canonical_facts_temporal ON canonical_facts(valid_from, valid_to, recorded_at);")
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Execute the authoritative schema script against the provided connection idempotently.
     
@@ -173,6 +201,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _ensure_outreach_drafts_columns(conn)
         _ensure_human_review_events_columns(conn)
         _ensure_canonical_facts_molecular_columns(conn)
+        _ensure_canonical_facts_bitemporal_columns(conn)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize database schema: {exc}") from exc
 

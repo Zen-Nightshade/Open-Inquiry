@@ -9,10 +9,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.researcher.models import ConfidenceLevel, VerificationStatus
+from src.researcher.temporal import (
+    DatePrecision,
+    TemporalKind,
+    determine_temporal_kind,
+    get_current_iso_timestamp,
+    parse_partial_date,
+)
 
 logger = logging.getLogger(__name__)
 
-MOLECULAR_SCHEMA_VERSION = 1
+MOLECULAR_SCHEMA_VERSION = 2
 
 
 class ValueType(str, Enum):
@@ -133,7 +140,34 @@ class MolecularFact(BaseModel):
     temporal_scope: Optional[str] = Field(default=None, description="Textual temporal frame (e.g. 'Q3 2024')")
     event_date: Optional[date] = Field(default=None, description="Consensus event date if known")
 
-    # Epistemic & Derivation Metadata
+    # Bitemporal History Fields (M2.2)
+    valid_from: Optional[str] = Field(
+        default=None, description="Beginning of real-world validity period (ISO date or partial date YYYY / YYYY-MM)"
+    )
+    valid_to: Optional[str] = Field(
+        default=None, description="End of real-world validity period if known; None if ongoing or unknown"
+    )
+    observed_at: str = Field(
+        default_factory=get_current_iso_timestamp,
+        description="When information was observed from source or evidence (ISO 8601 timestamp)",
+    )
+    recorded_at: str = Field(
+        default_factory=get_current_iso_timestamp,
+        description="When assertion was persisted in system (ISO 8601 timestamp)",
+    )
+    temporal_kind: TemporalKind = Field(
+        default=TemporalKind.EVENT,
+        description="Distinguishes instantaneous event occurrence from durative ongoing state",
+    )
+
+    # Epistemic & Evidence Provenance (M2.2)
+    evidence_ids: Tuple[str, ...] = Field(
+        default=(), description="Exact evidence IDs directly corroborating this specific proposition"
+    )
+    inherited_evidence: bool = Field(
+        default=True,
+        description="True if evidence is inherited from parent CanonicalFact; False if independently established",
+    )
     is_decomposed: bool = Field(default=False, description="True if split from a compound statement")
     confidence: ConfidenceLevel = Field(default=ConfidenceLevel.MEDIUM)
     verification_status: VerificationStatus = Field(default=VerificationStatus.SUPPORTED)
@@ -155,6 +189,13 @@ class MolecularFact(BaseModel):
             "qualifiers": self.qualifiers,
             "temporal_scope": self.temporal_scope,
             "event_date": self.event_date.isoformat() if self.event_date else None,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "observed_at": self.observed_at,
+            "recorded_at": self.recorded_at,
+            "temporal_kind": self.temporal_kind.value,
+            "evidence_ids": list(self.evidence_ids),
+            "inherited_evidence": self.inherited_evidence,
             "is_decomposed": self.is_decomposed,
             "confidence": self.confidence.value,
             "verification_status": self.verification_status.value,
@@ -207,6 +248,13 @@ class MolecularFact(BaseModel):
             except ValueError:
                 ev_date = None
 
+        # Temporal Kind
+        temp_kind_str = data.get("temporal_kind", TemporalKind.EVENT.value)
+        try:
+            temporal_kind = TemporalKind(temp_kind_str)
+        except ValueError:
+            temporal_kind = TemporalKind.EVENT
+
         # Object value
         obj_val_data = data.get("object_value")
         if isinstance(obj_val_data, dict):
@@ -232,6 +280,13 @@ class MolecularFact(BaseModel):
             qualifiers=dict(data.get("qualifiers") or {}),
             temporal_scope=data.get("temporal_scope"),
             event_date=ev_date,
+            valid_from=data.get("valid_from"),
+            valid_to=data.get("valid_to"),
+            observed_at=data.get("observed_at") or get_current_iso_timestamp(),
+            recorded_at=data.get("recorded_at") or get_current_iso_timestamp(),
+            temporal_kind=temporal_kind,
+            evidence_ids=tuple(data.get("evidence_ids") or ()),
+            inherited_evidence=bool(data.get("inherited_evidence", True)),
             is_decomposed=bool(data.get("is_decomposed", False)),
             confidence=confidence,
             verification_status=ver_status,

@@ -125,6 +125,10 @@ class FactExtractionService:
                         ),
                         composite_confidence=ConfidenceLevel(df["composite_confidence"]),
                         molecular_facts=deserialize_molecular_facts(df.get("molecular_data_json")),
+                        valid_from=df.get("valid_from"),
+                        valid_to=df.get("valid_to"),
+                        observed_at=df.get("observed_at"),
+                        recorded_at=df.get("recorded_at"),
                     )
                     active_acc.facts.append(c_fact)
 
@@ -153,6 +157,10 @@ class FactExtractionService:
                         if fact.molecular_facts
                         else None
                     ),
+                    valid_from=fact.valid_from,
+                    valid_to=fact.valid_to,
+                    observed_at=fact.observed_at,
+                    recorded_at=fact.recorded_at,
                 )
 
                 # 2. Link fact to entities

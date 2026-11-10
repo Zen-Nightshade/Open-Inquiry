@@ -417,9 +417,14 @@ CREATE TABLE IF NOT EXISTS canonical_facts (
     primary_event_date   TEXT,
     composite_confidence TEXT NOT NULL DEFAULT 'medium',
     molecular_data_json  TEXT,
+    valid_from           TEXT,
+    valid_to             TEXT,
+    observed_at          TEXT,
+    recorded_at          TEXT,
     created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_facts_session ON canonical_facts(session_id);
+CREATE INDEX IF NOT EXISTS idx_canonical_facts_temporal ON canonical_facts(valid_from, valid_to, recorded_at);
 
 CREATE TABLE IF NOT EXISTS fact_entity_links (
     fact_id   TEXT NOT NULL REFERENCES canonical_facts(fact_id) ON DELETE CASCADE,

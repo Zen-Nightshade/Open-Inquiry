@@ -14,6 +14,7 @@ from src.researcher.molecular_models import (
     ValueType,
 )
 from src.researcher.predicate_normalizer import PredicateNormalizer
+from src.researcher.temporal import determine_temporal_kind, get_current_iso_timestamp
 
 
 def parse_molecular_value(text: str) -> MolecularValue:
@@ -127,6 +128,14 @@ class MolecularTransformer:
         sub_id = subject_entity_id or (canonical_fact.entity_ids[0] if canonical_fact.entity_ids else None)
         sub_name = subject_name_override or self._extract_subject_name(claim_text)
 
+        evidence_ids = tuple(ev.evidence_id for ev in canonical_fact.evidence_records)
+        valid_from = canonical_fact.valid_from or (
+            canonical_fact.primary_event_date.isoformat() if canonical_fact.primary_event_date else None
+        )
+        valid_to = canonical_fact.valid_to
+        observed_at = canonical_fact.observed_at or get_current_iso_timestamp()
+        recorded_at = canonical_fact.recorded_at or get_current_iso_timestamp()
+
         # 1. Attempt bounded decomposition on coordinated clauses
         decomposed = self._try_decompose_coordinated_clauses(
             claim_text=claim_text,
@@ -135,6 +144,11 @@ class MolecularTransformer:
             subject_entity_id=sub_id,
             event_date=canonical_fact.primary_event_date,
             confidence=canonical_fact.composite_confidence,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=observed_at,
+            recorded_at=recorded_at,
+            evidence_ids=evidence_ids,
         )
         if decomposed:
             return decomposed
@@ -148,6 +162,11 @@ class MolecularTransformer:
             event_date=canonical_fact.primary_event_date,
             confidence=canonical_fact.composite_confidence,
             is_decomposed=False,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=observed_at,
+            recorded_at=recorded_at,
+            evidence_ids=evidence_ids,
         )
         return (atom,)
 
@@ -159,6 +178,11 @@ class MolecularTransformer:
         subject_entity_id: Optional[str],
         event_date: Any,
         confidence: ConfidenceLevel,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
+        evidence_ids: Tuple[str, ...] = (),
     ) -> Optional[Tuple[MolecularFact, ...]]:
         """Bounded decomposition splitting high-confidence coordinated clauses with shared subject."""
         # Conservative check: do not split if relative pronouns or subordinate conjunctions exist
@@ -205,6 +229,11 @@ class MolecularTransformer:
             event_date=event_date,
             confidence=confidence,
             is_decomposed=True,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=observed_at,
+            recorded_at=recorded_at,
+            evidence_ids=evidence_ids,
         )
 
         atom2 = self._parse_clause(
@@ -215,6 +244,11 @@ class MolecularTransformer:
             event_date=event_date,
             confidence=confidence,
             is_decomposed=True,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=observed_at,
+            recorded_at=recorded_at,
+            evidence_ids=evidence_ids,
         )
 
         if atom1 and atom2:
@@ -231,6 +265,11 @@ class MolecularTransformer:
         event_date: Any,
         confidence: ConfidenceLevel,
         is_decomposed: bool,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
+        evidence_ids: Tuple[str, ...] = (),
     ) -> MolecularFact:
         """Parse an individual verb-object clause into an atomic MolecularFact."""
         # Find leading verb phrase
@@ -238,6 +277,11 @@ class MolecularTransformer:
         norm_res = self.normalizer.normalize(pred)
         mol_value = parse_molecular_value(obj)
         qualifiers = self._extract_qualifiers(obj, norm_res.normalized_predicate)
+
+        pred_key = norm_res.normalized_predicate.value if norm_res.normalized_predicate else pred
+        temp_kind = determine_temporal_kind(pred_key)
+        obs_at = observed_at or get_current_iso_timestamp()
+        rec_at = recorded_at or get_current_iso_timestamp()
 
         atom_text = f"{subject} {pred} {obj}".strip()
         return MolecularFact(
@@ -254,6 +298,13 @@ class MolecularTransformer:
             polarity=norm_res.polarity,
             qualifiers=qualifiers,
             event_date=event_date,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=obs_at,
+            recorded_at=rec_at,
+            temporal_kind=temp_kind,
+            evidence_ids=evidence_ids,
+            inherited_evidence=True,
             is_decomposed=is_decomposed,
             confidence=confidence,
             verification_status=VerificationStatus.SUPPORTED,
@@ -268,12 +319,22 @@ class MolecularTransformer:
         event_date: Any,
         confidence: ConfidenceLevel,
         is_decomposed: bool,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
+        evidence_ids: Tuple[str, ...] = (),
     ) -> MolecularFact:
         """Create a single MolecularFact when decomposition is not applicable."""
         pred, obj = self._split_predicate_and_object(claim_text, subject_name=subject_name)
         norm_res = self.normalizer.normalize(pred)
         mol_value = parse_molecular_value(obj)
         qualifiers = self._extract_qualifiers(obj, norm_res.normalized_predicate)
+
+        pred_key = norm_res.normalized_predicate.value if norm_res.normalized_predicate else pred
+        temp_kind = determine_temporal_kind(pred_key)
+        obs_at = observed_at or get_current_iso_timestamp()
+        rec_at = recorded_at or get_current_iso_timestamp()
 
         return MolecularFact(
             molecular_id=str(uuid.uuid4()),
@@ -289,6 +350,13 @@ class MolecularTransformer:
             polarity=norm_res.polarity,
             qualifiers=qualifiers,
             event_date=event_date,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            observed_at=obs_at,
+            recorded_at=rec_at,
+            temporal_kind=temp_kind,
+            evidence_ids=evidence_ids,
+            inherited_evidence=True,
             is_decomposed=is_decomposed,
             confidence=confidence,
             verification_status=VerificationStatus.SUPPORTED,

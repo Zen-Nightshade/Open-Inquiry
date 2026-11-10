@@ -21,18 +21,31 @@ class AssertionRepository:
         primary_event_date: Optional[str] = None,
         composite_confidence: str = "medium",
         molecular_data_json: Optional[str] = None,
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        observed_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = created_at or datetime.now(timezone.utc).isoformat()
+        rec_at = recorded_at or now
+        obs_at = observed_at or now
+        v_from = valid_from or primary_event_date
+
         sql = """
         INSERT INTO canonical_facts (
             fact_id, session_id, claim_text, fact_category,
-            primary_event_date, composite_confidence, molecular_data_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            primary_event_date, composite_confidence, molecular_data_json,
+            valid_from, valid_to, observed_at, recorded_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fact_id) DO UPDATE SET
             composite_confidence = excluded.composite_confidence,
             primary_event_date = coalesce(canonical_facts.primary_event_date, excluded.primary_event_date),
-            molecular_data_json = coalesce(excluded.molecular_data_json, canonical_facts.molecular_data_json);
+            molecular_data_json = coalesce(excluded.molecular_data_json, canonical_facts.molecular_data_json),
+            valid_from = coalesce(excluded.valid_from, canonical_facts.valid_from),
+            valid_to = coalesce(excluded.valid_to, canonical_facts.valid_to),
+            observed_at = coalesce(excluded.observed_at, canonical_facts.observed_at),
+            recorded_at = coalesce(excluded.recorded_at, canonical_facts.recorded_at);
         """
         self.conn.execute(
             sql,
@@ -44,6 +57,10 @@ class AssertionRepository:
                 primary_event_date,
                 composite_confidence,
                 molecular_data_json,
+                v_from,
+                valid_to,
+                obs_at,
+                rec_at,
                 now,
             ),
         )
@@ -115,6 +132,94 @@ class AssertionRepository:
           AND e.resolution_status IN ('unresolved', 'ambiguous', 'partially_resolved');
         """
         cursor = self.conn.execute(sql, (session_id,))
+        return [dict(r) for r in cursor.fetchall()]
+
+    # Bitemporal History & Historical Query Methods (M2.2)
+    def get_current_assertions(
+        self, entity_id: str, as_of_valid_time: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Retrieve currently valid factual assertions for an entity.
+        
+        If as_of_valid_time is supplied, retrieves assertions valid at that real-world time.
+        Otherwise, retrieves assertions where valid_to is NULL or >= current date.
+        """
+        if as_of_valid_time:
+            sql = """
+            SELECT DISTINCT f.* FROM canonical_facts f
+            JOIN fact_entity_links l ON f.fact_id = l.fact_id
+            WHERE l.entity_id = ?
+              AND (f.valid_from IS NULL OR f.valid_from <= ?)
+              AND (f.valid_to IS NULL OR f.valid_to >= ?)
+            ORDER BY coalesce(f.valid_from, f.primary_event_date) DESC, f.recorded_at DESC;
+            """
+            cursor = self.conn.execute(sql, (entity_id, as_of_valid_time, as_of_valid_time))
+        else:
+            sql = """
+            SELECT DISTINCT f.* FROM canonical_facts f
+            JOIN fact_entity_links l ON f.fact_id = l.fact_id
+            WHERE l.entity_id = ?
+              AND (f.valid_to IS NULL OR f.valid_to >= date('now'))
+            ORDER BY coalesce(f.valid_from, f.primary_event_date) DESC, f.recorded_at DESC;
+            """
+            cursor = self.conn.execute(sql, (entity_id,))
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_assertions_as_of(
+        self,
+        entity_id: str,
+        valid_time: Optional[str] = None,
+        recorded_cutoff: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Bitemporal point-in-time historical reconstruction.
+        
+        Reconstructs what the system believed at a recording-time cutoff (recorded_cutoff),
+        and/or what was true in the real world at a valid-time point (valid_time).
+        """
+        conditions = ["l.entity_id = ?"]
+        params: List[Any] = [entity_id]
+
+        if recorded_cutoff:
+            conditions.append("coalesce(f.recorded_at, f.created_at) <= ?")
+            params.append(recorded_cutoff)
+
+        if valid_time:
+            conditions.append("(f.valid_from IS NULL OR f.valid_from <= ?)")
+            conditions.append("(f.valid_to IS NULL OR f.valid_to >= ?)")
+            params.append(valid_time)
+            params.append(valid_time)
+
+        where_clause = " AND ".join(conditions)
+        sql = f"""
+        SELECT DISTINCT f.* FROM canonical_facts f
+        JOIN fact_entity_links l ON f.fact_id = l.fact_id
+        WHERE {where_clause}
+        ORDER BY coalesce(f.valid_from, f.primary_event_date) ASC, coalesce(f.recorded_at, f.created_at) ASC;
+        """
+        cursor = self.conn.execute(sql, tuple(params))
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_assertion_history(
+        self, entity_id: str, predicate: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Retrieve the chronological evolution of assertions recorded for an entity over time."""
+        if predicate:
+            sql = """
+            SELECT DISTINCT f.* FROM canonical_facts f
+            JOIN fact_entity_links l ON f.fact_id = l.fact_id
+            WHERE l.entity_id = ?
+              AND (f.fact_category = ? OR f.claim_text LIKE ? OR f.molecular_data_json LIKE ?)
+            ORDER BY coalesce(f.valid_from, f.primary_event_date) ASC, coalesce(f.recorded_at, f.created_at) ASC;
+            """
+            like_pred = f"%{predicate}%"
+            cursor = self.conn.execute(sql, (entity_id, predicate, like_pred, like_pred))
+        else:
+            sql = """
+            SELECT DISTINCT f.* FROM canonical_facts f
+            JOIN fact_entity_links l ON f.fact_id = l.fact_id
+            WHERE l.entity_id = ?
+            ORDER BY coalesce(f.valid_from, f.primary_event_date) ASC, coalesce(f.recorded_at, f.created_at) ASC;
+            """
+            cursor = self.conn.execute(sql, (entity_id,))
         return [dict(r) for r in cursor.fetchall()]
 
     # Fact-Evidence links

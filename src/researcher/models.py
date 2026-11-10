@@ -29,6 +29,9 @@ class VerificationStatus(str, Enum):
     CONTRADICTED = "contradicted" # Contradicted by research evidence
 
 
+from src.researcher.molecular_models import MolecularFact
+
+
 
 class ResolutionStatus(str, Enum):
     RESOLVED = "resolved"
@@ -144,9 +147,25 @@ class CanonicalFact(BaseModel):
     primary_event_date: Optional[date] = Field(default=None, description="Consensus event date")
     composite_confidence: ConfidenceLevel = Field(default=ConfidenceLevel.MEDIUM)
     provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and producing component metadata")
-    molecular_facts: Tuple[Any, ...] = Field(
+    molecular_facts: Tuple[MolecularFact, ...] = Field(
         default=(),
         description="Atomic molecular propositions representing this claim; empty if un-decomposed",
+    )
+    valid_from: Optional[str] = Field(
+        default=None,
+        description="Beginning of real-world validity period (ISO date or partial date YYYY / YYYY-MM)",
+    )
+    valid_to: Optional[str] = Field(
+        default=None,
+        description="End of real-world validity period if known; None if ongoing or unknown",
+    )
+    observed_at: Optional[str] = Field(
+        default=None,
+        description="When information was observed from source or evidence (ISO 8601 timestamp)",
+    )
+    recorded_at: Optional[str] = Field(
+        default=None,
+        description="When assertion was persisted in system (ISO 8601 timestamp)",
     )
 
     @property
@@ -262,7 +281,12 @@ class ResearchAccumulator:
                         evidence_records=merged_evidence,
                         primary_event_date=existing.primary_event_date or new_fact.primary_event_date,
                         composite_confidence=composite_conf,
+                        provenance=existing.provenance or new_fact.provenance,
                         molecular_facts=existing.molecular_facts or new_fact.molecular_facts,
+                        valid_from=existing.valid_from or new_fact.valid_from,
+                        valid_to=existing.valid_to or new_fact.valid_to,
+                        observed_at=existing.observed_at or new_fact.observed_at,
+                        recorded_at=existing.recorded_at or new_fact.recorded_at,
                     )
                     self.facts[idx] = updated
                     return

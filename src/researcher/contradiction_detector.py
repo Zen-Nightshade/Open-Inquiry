@@ -12,6 +12,11 @@ from src.researcher.molecular_models import (
     Polarity,
     ValueType,
 )
+from src.researcher.temporal import (
+    intervals_overlap,
+    is_temporally_sequential,
+    normalize_to_comparable_bounds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +43,11 @@ class ContradictionEvaluation(BaseModel):
 
 
 class ContradictionDetector:
-    """Conservative contradiction detector for structured molecular facts."""
+    """Conservative contradiction detector for structured molecular facts with bitemporal awareness."""
 
-    # Opposed / mutually exclusive predicate pairs
-    _OPPOSED_PREDICATES: Dict[NormalizedPredicate, NormalizedPredicate] = {
-        NormalizedPredicate.FACILITY_OPENED: NormalizedPredicate.FACILITY_CLOSED,
-        NormalizedPredicate.FACILITY_CLOSED: NormalizedPredicate.FACILITY_OPENED,
-        NormalizedPredicate.LEADERSHIP_APPOINTED: NormalizedPredicate.LEADERSHIP_DEPARTED,
-        NormalizedPredicate.LEADERSHIP_DEPARTED: NormalizedPredicate.LEADERSHIP_APPOINTED,
-    }
+    # Note: FACILITY_OPENED / FACILITY_CLOSED and LEADERSHIP_APPOINTED / LEADERSHIP_DEPARTED
+    # are distinct point-in-time lifecycle events and must NOT be treated as automatic contradictions.
+    _OPPOSED_PREDICATES: Dict[NormalizedPredicate, NormalizedPredicate] = {}
 
     def evaluate(self, fact_a: MolecularFact, fact_b: MolecularFact) -> ContradictionEvaluation:
         """Evaluate whether two molecular propositions contradict each other."""
@@ -76,7 +77,16 @@ class ContradictionDetector:
             is_same_pred = norm_a == norm_b
             is_opposed_pred = self._OPPOSED_PREDICATES.get(norm_a) == norm_b
 
-            if not is_same_pred and not is_opposed_pred:
+            is_employment_pair = (
+                norm_a in (NormalizedPredicate.LEADERSHIP_APPOINTED, NormalizedPredicate.LEADERSHIP_DEPARTED) and
+                norm_b in (NormalizedPredicate.LEADERSHIP_APPOINTED, NormalizedPredicate.LEADERSHIP_DEPARTED)
+            )
+            is_facility_pair = (
+                norm_a in (NormalizedPredicate.FACILITY_OPENED, NormalizedPredicate.FACILITY_CLOSED) and
+                norm_b in (NormalizedPredicate.FACILITY_OPENED, NormalizedPredicate.FACILITY_CLOSED)
+            )
+
+            if not is_same_pred and not is_opposed_pred and not is_employment_pair and not is_facility_pair:
                 # Different, non-opposed predicates (e.g. FUNDING_RAISED vs HIRING_EXECUTED)
                 return self._no_conflict(fact_a, fact_b, f"Predicates '{norm_a.value}' and '{norm_b.value}' are mutually compatible.")
 
@@ -88,6 +98,11 @@ class ContradictionDetector:
                 loc_a = fact_a.qualifiers.get("location")
                 loc_b = fact_b.qualifiers.get("location")
                 if not loc_a or not loc_b or loc_a.lower() == loc_b.lower():
+                    date_a = fact_a.valid_from or (fact_a.event_date.isoformat() if fact_a.event_date else None)
+                    date_b = fact_b.valid_from or (fact_b.event_date.isoformat() if fact_b.event_date else None)
+                    if is_temporally_sequential(date_a, date_b):
+                        return self._no_conflict(fact_a, fact_b, f"Polarity change across sequential periods: {date_a} vs {date_b}.")
+
                     return ContradictionEvaluation(
                         status=ContradictionStatus.CONTRADICTION,
                         severity="confirmed",
@@ -172,7 +187,7 @@ class ContradictionDetector:
     def _check_employment_contradiction(
         self, fact_a: MolecularFact, fact_b: MolecularFact
     ) -> ContradictionEvaluation:
-        """Evaluate leadership/employment contradictions (joined vs resigned)."""
+        """Evaluate leadership/employment assertions (appointment vs departure)."""
         is_opposed = (
             (fact_a.normalized_predicate == NormalizedPredicate.LEADERSHIP_APPOINTED and
              fact_b.normalized_predicate == NormalizedPredicate.LEADERSHIP_DEPARTED) or
@@ -180,47 +195,45 @@ class ContradictionDetector:
              fact_b.normalized_predicate == NormalizedPredicate.LEADERSHIP_APPOINTED)
         )
 
-        if not is_opposed:
-            # e.g. both appointed or both departed for different roles -> compatible
-            return self._no_conflict(fact_a, fact_b, "Employment milestones are compatible.")
+        if is_opposed:
+            # Appointment and departure are distinct lifecycle events, NOT automatic contradictions!
+            date_a = fact_a.valid_from or (fact_a.event_date.isoformat() if fact_a.event_date else None)
+            date_b = fact_b.valid_from or (fact_b.event_date.isoformat() if fact_b.event_date else None)
+            if is_temporally_sequential(date_a, date_b):
+                return self._no_conflict(fact_a, fact_b, f"Sequential career milestones with distinct dates: {date_a} vs {date_b}.")
 
-        date_a = fact_a.event_date
-        date_b = fact_b.event_date
+            # If both explicitly claim mutually exclusive concurrent current status on the exact same date
+            text_a = fact_a.atom_text.lower()
+            text_b = fact_b.atom_text.lower()
+            current_markers = ("currently", "current", "serving as", "serves as", "heads", "leads")
+            a_is_current = any(m in text_a for m in current_markers)
+            b_is_current = any(m in text_b for m in current_markers)
 
-        # If distinct sequential dates exist -> sequential milestones, NOT a contradiction
-        if date_a and date_b and date_a != date_b:
-            return self._no_conflict(fact_a, fact_b, f"Sequential career milestones with distinct dates: {date_a} vs {date_b}.")
+            if (date_a and date_b and date_a == date_b) or a_is_current or b_is_current:
+                return ContradictionEvaluation(
+                    status=ContradictionStatus.CONTRADICTION,
+                    severity="confirmed",
+                    reason=f"[CONFIRMED] Contradictory concurrent employment status: '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
+                    fact_id_a=fact_a.parent_canonical_id,
+                    fact_id_b=fact_b.parent_canonical_id,
+                    molecular_id_a=fact_a.molecular_id,
+                    molecular_id_b=fact_b.molecular_id,
+                    conflicting_attributes=["normalized_predicate"],
+                )
 
-        text_a = fact_a.atom_text.lower()
-        text_b = fact_b.atom_text.lower()
-        current_markers = ("currently", "current", "serving as", "serves as", "heads", "leads")
-        a_is_current = any(m in text_a for m in current_markers)
-        b_is_current = any(m in text_b for m in current_markers)
-
-        # Confirmed conflict: identical event dates, or explicit concurrent current status
-        if (date_a and date_b and date_a == date_b) or a_is_current or b_is_current:
+            # Potential conflict: missing dates prevent determining whether milestones were sequential
             return ContradictionEvaluation(
-                status=ContradictionStatus.CONTRADICTION,
-                severity="confirmed",
-                reason=f"[CONFIRMED] Contradictory employment status: '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
+                status=ContradictionStatus.POTENTIAL_CONTRADICTION,
+                severity="potential",
+                reason=f"[POTENTIAL] Potential conflict (missing dates): '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
                 fact_id_a=fact_a.parent_canonical_id,
                 fact_id_b=fact_b.parent_canonical_id,
                 molecular_id_a=fact_a.molecular_id,
                 molecular_id_b=fact_b.molecular_id,
-                conflicting_attributes=["normalized_predicate", "modality"],
+                conflicting_attributes=["normalized_predicate"],
             )
 
-        # Potential conflict: missing dates prevent determining whether milestones were sequential
-        return ContradictionEvaluation(
-            status=ContradictionStatus.POTENTIAL_CONTRADICTION,
-            severity="potential",
-            reason=f"[POTENTIAL] Potential conflict (missing dates): '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
-            fact_id_a=fact_a.parent_canonical_id,
-            fact_id_b=fact_b.parent_canonical_id,
-            molecular_id_a=fact_a.molecular_id,
-            molecular_id_b=fact_b.molecular_id,
-            conflicting_attributes=["event_date", "normalized_predicate"],
-        )
+        return self._no_conflict(fact_a, fact_b, "Employment milestones are compatible.")
 
     def _check_facility_contradiction(
         self, fact_a: MolecularFact, fact_b: MolecularFact
@@ -235,20 +248,14 @@ class ContradictionDetector:
 
         is_opposed = fact_a.normalized_predicate != fact_b.normalized_predicate
         if is_opposed:
-            date_a = fact_a.event_date
-            date_b = fact_b.event_date
-            if date_a and date_b and date_a != date_b:
+            date_a = fact_a.valid_from or (fact_a.event_date.isoformat() if fact_a.event_date else None)
+            date_b = fact_b.valid_from or (fact_b.event_date.isoformat() if fact_b.event_date else None)
+            if is_temporally_sequential(date_a, date_b):
                 return self._no_conflict(fact_a, fact_b, f"Sequential facility lifecycle milestones: {date_a} vs {date_b}.")
 
-            return ContradictionEvaluation(
-                status=ContradictionStatus.CONTRADICTION,
-                severity="confirmed",
-                reason=f"[CONFIRMED] Mutually exclusive facility status: '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
-                fact_id_a=fact_a.parent_canonical_id,
-                fact_id_b=fact_b.parent_canonical_id,
-                molecular_id_a=fact_a.molecular_id,
-                molecular_id_b=fact_b.molecular_id,
-                conflicting_attributes=["normalized_predicate"],
+            # Distinct lifecycle events (opening and closing) are NOT automatic contradictions
+            return self._no_conflict(
+                fact_a, fact_b, "Facility opened and facility closed are distinct lifecycle events, not a contradiction."
             )
 
         return self._no_conflict(fact_a, fact_b, "Facility events are compatible.")
@@ -256,7 +263,7 @@ class ContradictionDetector:
     def _check_headcount_contradiction(
         self, fact_a: MolecularFact, fact_b: MolecularFact
     ) -> ContradictionEvaluation:
-        """Evaluate headcount metrics, respecting scope and dates."""
+        """Evaluate headcount metrics, respecting scope and bitemporal dates."""
         loc_a = fact_a.qualifiers.get("location")
         loc_b = fact_b.qualifiers.get("location")
 
@@ -264,28 +271,53 @@ class ContradictionDetector:
         if loc_a and loc_b and loc_a.lower() != loc_b.lower():
             return self._no_conflict(fact_a, fact_b, "Headcount metrics describe different office locations.")
 
-        date_a = fact_a.event_date
-        date_b = fact_b.event_date
-        if date_a and date_b and date_a != date_b:
-            # Different dates reflect organic workforce growth or change
-            return self._no_conflict(fact_a, fact_b, f"Headcount metrics describe different dates: {date_a} vs {date_b}.")
-
         val_a = fact_a.object_value.normalized_value
         val_b = fact_b.object_value.normalized_value
+
+        # If values match, no contradiction
+        if val_a is not None and val_b is not None and val_a == val_b:
+            return self._no_conflict(fact_a, fact_b, "Headcount values are identical.")
+
+        # Check bitemporal valid dates
+        date_a = fact_a.valid_from or (fact_a.event_date.isoformat() if fact_a.event_date else None)
+        date_b = fact_b.valid_from or (fact_b.event_date.isoformat() if fact_b.event_date else None)
+
         if val_a is not None and val_b is not None and val_a != val_b:
-            if (date_a and date_b and date_a == date_b) or ("current" in fact_a.atom_text.lower() and "current" in fact_b.atom_text.lower()):
+            if is_temporally_sequential(date_a, date_b, fact_a.valid_to, fact_b.valid_to):
+                # Sequential dates reflect organic workforce growth or change over time
+                return self._no_conflict(
+                    fact_a,
+                    fact_b,
+                    f"Headcount metrics describe sequential dates ({date_a} vs {date_b}) representing evolution over time.",
+                )
+
+            # Check for overlapping known validity periods
+            overlaps, is_certain = intervals_overlap(date_a, fact_a.valid_to, date_b, fact_b.valid_to)
+            if overlaps and is_certain:
                 return ContradictionEvaluation(
                     status=ContradictionStatus.CONTRADICTION,
                     severity="confirmed",
-                    reason=f"[CONFIRMED] Conflicting concurrent headcount metrics: '{fact_a.atom_text}' vs '{fact_b.atom_text}'",
+                    reason=f"[CONFIRMED] Conflicting concurrent headcount metrics for overlapping period ({date_a} vs {date_b}): '{fact_a.atom_text}' ({val_a}) vs '{fact_b.atom_text}' ({val_b})",
                     fact_id_a=fact_a.parent_canonical_id,
                     fact_id_b=fact_b.parent_canonical_id,
                     molecular_id_a=fact_a.molecular_id,
                     molecular_id_b=fact_b.molecular_id,
-                    conflicting_attributes=["object_value"],
+                    conflicting_attributes=["object_value", "valid_from"],
                 )
 
-        return self._no_conflict(fact_a, fact_b, "Headcount metrics are compatible or undated.")
+            # Missing or uncertain dates: cannot establish simultaneity or sequence
+            return ContradictionEvaluation(
+                status=ContradictionStatus.POTENTIAL_CONTRADICTION,
+                severity="potential",
+                reason=f"[POTENTIAL] Conflicting headcount metrics with uncertain or missing dates ({date_a} vs {date_b}): '{fact_a.atom_text}' ({val_a}) vs '{fact_b.atom_text}' ({val_b})",
+                fact_id_a=fact_a.parent_canonical_id,
+                fact_id_b=fact_b.parent_canonical_id,
+                molecular_id_a=fact_a.molecular_id,
+                molecular_id_b=fact_b.molecular_id,
+                conflicting_attributes=["object_value"],
+            )
+
+        return self._no_conflict(fact_a, fact_b, "Headcount metrics are compatible.")
 
     def _no_conflict(
         self, fact_a: MolecularFact, fact_b: MolecularFact, reason: str
