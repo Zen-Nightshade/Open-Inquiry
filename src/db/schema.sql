@@ -278,10 +278,15 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
     publication_date     TEXT,
     publication_date_src TEXT,
     fetch_date           TEXT NOT NULL,
-    duration_ms          REAL
+    duration_ms          REAL,
+    raw_content_hash     TEXT,
+    normalized_content_hash TEXT,
+    minhash_signature    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_source_snapshots_source ON source_snapshots(source_id);
 CREATE INDEX IF NOT EXISTS idx_source_snapshots_session ON source_snapshots(session_id);
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_raw_hash ON source_snapshots(raw_content_hash);
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_norm_hash ON source_snapshots(normalized_content_hash);
 
 CREATE TABLE IF NOT EXISTS evidence_passages (
     evidence_id       TEXT PRIMARY KEY,
@@ -298,10 +303,13 @@ CREATE INDEX IF NOT EXISTS idx_evidence_passages_snapshot ON evidence_passages(s
 CREATE INDEX IF NOT EXISTS idx_evidence_passages_source ON evidence_passages(source_id);
 
 CREATE TABLE IF NOT EXISTS evidence_origin_groups (
-    group_id            TEXT PRIMARY KEY,
-    canonical_source_id TEXT NOT NULL REFERENCES sources(source_id) ON DELETE CASCADE,
-    description         TEXT,
-    created_at          TEXT NOT NULL
+    group_id                 TEXT PRIMARY KEY,
+    canonical_source_id      TEXT NOT NULL REFERENCES sources(source_id) ON DELETE CASCADE,
+    description              TEXT,
+    created_at               TEXT NOT NULL,
+    dependence_type          TEXT,
+    primary_detection_method TEXT,
+    average_similarity       REAL
 );
 
 CREATE TABLE IF NOT EXISTS evidence_origin_members (
@@ -421,6 +429,7 @@ CREATE TABLE IF NOT EXISTS canonical_facts (
     valid_to             TEXT,
     observed_at          TEXT,
     recorded_at          TEXT,
+    independent_source_count INTEGER,
     created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_facts_session ON canonical_facts(session_id);

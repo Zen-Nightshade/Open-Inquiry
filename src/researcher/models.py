@@ -167,11 +167,56 @@ class CanonicalFact(BaseModel):
         default=None,
         description="When assertion was persisted in system (ISO 8601 timestamp)",
     )
+    independent_source_count: Optional[int] = Field(
+        default=None,
+        description="Number of independent source clusters corroborating this fact",
+    )
 
     @property
     def source_ids(self) -> List[str]:
         """All unique source IDs that corroborate this fact."""
         return list(dict.fromkeys(ev.source_id for ev in self.evidence_records))
+
+    def get_evidence_aggregation_summary(
+        self, syndication_groups: Optional[Dict[str, Set[str]]] = None
+    ) -> Dict[str, Any]:
+        """Calculate and return evidence aggregation statistics including independence metrics.
+
+        Distinguishes total source records from independent corroborating sources.
+        Does NOT alter the underlying evidence records or drop duplicate sources.
+        """
+        total_evidence_records = len(self.evidence_records)
+        unique_sources = self.source_ids
+        total_source_records = len(unique_sources)
+
+        if syndication_groups:
+            source_to_cluster: Dict[str, str] = {}
+            for cluster_id, member_ids in syndication_groups.items():
+                for member_id in member_ids:
+                    source_to_cluster[member_id] = cluster_id
+            independent_clusters = {source_to_cluster.get(s, s) for s in unique_sources}
+            cluster_count = len(independent_clusters)
+        else:
+            cluster_count = (
+                self.independent_source_count
+                if self.independent_source_count is not None
+                else total_source_records
+            )
+
+        return {
+            "fact_id": self.fact_id,
+            "claim_text": self.claim_text,
+            "composite_confidence": (
+                self.composite_confidence.value
+                if hasattr(self.composite_confidence, "value")
+                else str(self.composite_confidence)
+            ),
+            "total_evidence_records": total_evidence_records,
+            "total_source_records": total_source_records,
+            "independent_cluster_count": cluster_count,
+            "is_corroborated_independently": cluster_count > 1,
+            "source_ids": unique_sources,
+        }
 
 
 # Alias for backwards compatibility with earlier blueprint references
@@ -234,6 +279,7 @@ class ResearchAccumulator:
         new_fact: CanonicalFact,
         match_fact_id: Optional[str] = None,
         is_independent: bool = True,
+        syndication_groups: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         """Add a new fact or merge evidence into an existing fact without losing source evidence."""
         if match_fact_id is not None:
@@ -256,16 +302,28 @@ class ResearchAccumulator:
                     merged_entity_ids = list(dict.fromkeys(existing.entity_ids + new_fact.entity_ids))
                     unique_sources = list(dict.fromkeys(ev.source_id for ev in merged_evidence))
 
+                    # Map sources through syndication groups to calculate independent clusters
+                    if syndication_groups:
+                        source_to_cluster: Dict[str, str] = {}
+                        for cluster_id, member_ids in syndication_groups.items():
+                            for member_id in member_ids:
+                                source_to_cluster[member_id] = cluster_id
+                        independent_clusters = {source_to_cluster.get(s, s) for s in unique_sources}
+                        indep_count = len(independent_clusters)
+                    else:
+                        indep_count = len(unique_sources) if is_independent else 1
+
                     # Confidence calibration:
                     # Keep source credibility and evidence independence as separate dimensions.
                     # Multiple low-quality sources cannot automatically establish HIGH confidence.
-                    # Upgrading to HIGH requires independent corroboration AND at least one substantial evidence record (>= MEDIUM).
+                    # Upgrading to HIGH requires independent corroboration (indep_count > 1 and is_independent)
+                    # AND at least one substantial evidence record (>= MEDIUM).
                     has_substantial_evidence = any(
                         ev.confidence in (ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM)
                         for ev in merged_evidence
                     )
 
-                    if is_independent and len(unique_sources) > 1:
+                    if is_independent and indep_count > 1:
                         if has_substantial_evidence:
                             composite_conf = ConfidenceLevel.HIGH
                         else:
@@ -287,11 +345,42 @@ class ResearchAccumulator:
                         valid_to=existing.valid_to or new_fact.valid_to,
                         observed_at=existing.observed_at or new_fact.observed_at,
                         recorded_at=existing.recorded_at or new_fact.recorded_at,
+                        independent_source_count=indep_count,
                     )
                     self.facts[idx] = updated
                     return
 
-        self.facts.append(new_fact)
+        # Add new fact
+        if new_fact.independent_source_count is None:
+            if syndication_groups:
+                source_to_cluster = {}
+                for cluster_id, member_ids in syndication_groups.items():
+                    for member_id in member_ids:
+                        source_to_cluster[member_id] = cluster_id
+                indep_clusters = {source_to_cluster.get(s, s) for s in new_fact.source_ids}
+                indep_count = len(indep_clusters)
+            else:
+                indep_count = len(new_fact.source_ids)
+
+            fact_to_add = CanonicalFact(
+                fact_id=new_fact.fact_id,
+                claim_text=new_fact.claim_text,
+                fact_category=new_fact.fact_category,
+                entity_ids=new_fact.entity_ids,
+                evidence_records=new_fact.evidence_records,
+                primary_event_date=new_fact.primary_event_date,
+                composite_confidence=new_fact.composite_confidence,
+                provenance=new_fact.provenance,
+                molecular_facts=new_fact.molecular_facts,
+                valid_from=new_fact.valid_from,
+                valid_to=new_fact.valid_to,
+                observed_at=new_fact.observed_at,
+                recorded_at=new_fact.recorded_at,
+                independent_source_count=indep_count,
+            )
+            self.facts.append(fact_to_add)
+        else:
+            self.facts.append(new_fact)
 
     def to_package(
         self,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 class SourceRepository:
@@ -121,14 +121,18 @@ class SourceRepository:
         publication_date: Optional[str] = None,
         publication_date_src: Optional[str] = None,
         duration_ms: Optional[float] = None,
+        raw_content_hash: Optional[str] = None,
+        normalized_content_hash: Optional[str] = None,
+        minhash_signature: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = fetch_date or datetime.now(timezone.utc).isoformat()
         sql = """
         INSERT INTO source_snapshots (
             snapshot_id, source_id, session_id, original_url, final_url,
             html_canonical_url, title, raw_text, raw_content_ref, fetch_status,
-            http_status_code, publication_date, publication_date_src, fetch_date, duration_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            http_status_code, publication_date, publication_date_src, fetch_date, duration_ms,
+            raw_content_hash, normalized_content_hash, minhash_signature
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         self.conn.execute(
             sql,
@@ -148,9 +152,47 @@ class SourceRepository:
                 publication_date_src,
                 now,
                 duration_ms,
+                raw_content_hash,
+                normalized_content_hash,
+                minhash_signature,
             ),
         )
         return self.get_snapshot(snapshot_id) or {}
+
+    def record_snapshot_fingerprint(
+        self,
+        snapshot_id: str,
+        raw_content_hash: str,
+        normalized_content_hash: str,
+        minhash_signature: Optional[str] = None,
+    ) -> bool:
+        sql = """
+        UPDATE source_snapshots
+        SET raw_content_hash = ?,
+            normalized_content_hash = ?,
+            minhash_signature = ?
+        WHERE snapshot_id = ?;
+        """
+        cursor = self.conn.execute(
+            sql, (raw_content_hash, normalized_content_hash, minhash_signature, snapshot_id)
+        )
+        return cursor.rowcount > 0
+
+    def get_snapshot_by_raw_hash(self, raw_hash: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            "SELECT * FROM source_snapshots WHERE raw_content_hash = ? ORDER BY fetch_date DESC LIMIT 1;",
+            (raw_hash,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_snapshot_by_normalized_hash(self, normalized_hash: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.execute(
+            "SELECT * FROM source_snapshots WHERE normalized_content_hash = ? ORDER BY fetch_date DESC LIMIT 1;",
+            (normalized_hash,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
     def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         cursor = self.conn.execute(
@@ -248,19 +290,45 @@ class SourceRepository:
         canonical_source_id: str,
         description: Optional[str] = None,
         created_at: Optional[str] = None,
+        dependence_type: Optional[str] = None,
+        primary_detection_method: Optional[str] = None,
+        average_similarity: Optional[float] = None,
     ) -> Dict[str, Any]:
         now = created_at or datetime.now(timezone.utc).isoformat()
         sql = """
-        INSERT INTO evidence_origin_groups (group_id, canonical_source_id, description, created_at)
-        VALUES (?, ?, ?, ?);
+        INSERT INTO evidence_origin_groups (
+            group_id, canonical_source_id, description, created_at,
+            dependence_type, primary_detection_method, average_similarity
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            canonical_source_id = excluded.canonical_source_id,
+            description = coalesce(excluded.description, evidence_origin_groups.description),
+            dependence_type = coalesce(excluded.dependence_type, evidence_origin_groups.dependence_type),
+            primary_detection_method = coalesce(excluded.primary_detection_method, evidence_origin_groups.primary_detection_method),
+            average_similarity = coalesce(excluded.average_similarity, evidence_origin_groups.average_similarity);
         """
-        self.conn.execute(sql, (group_id, canonical_source_id, description, now))
+        self.conn.execute(
+            sql,
+            (
+                group_id,
+                canonical_source_id,
+                description,
+                now,
+                dependence_type,
+                primary_detection_method,
+                average_similarity,
+            ),
+        )
+        return self.get_origin_group(group_id) or {}
+
+    def get_origin_group(self, group_id: str) -> Optional[Dict[str, Any]]:
         cursor = self.conn.execute(
             "SELECT * FROM evidence_origin_groups WHERE group_id = ?;",
             (group_id,),
         )
         row = cursor.fetchone()
-        return dict(row) if row else {}
+        return dict(row) if row else None
 
     def add_origin_member(self, group_id: str, source_id: str) -> bool:
         sql = """
@@ -279,3 +347,57 @@ class SourceRepository:
         """
         cursor = self.conn.execute(sql, (group_id,))
         return [dict(r) for r in cursor.fetchall()]
+
+    def save_syndication_cluster(self, cluster: Any) -> Dict[str, Any]:
+        """Persist a SyndicationCluster object or dict to evidence_origin_groups and evidence_origin_members."""
+        if hasattr(cluster, "cluster_id"):
+            c_id = cluster.cluster_id
+            can_id = cluster.canonical_source_id
+            desc = cluster.description
+            c_at = cluster.created_at
+            dep_type = (
+                cluster.dependence_type.value
+                if hasattr(cluster.dependence_type, "value")
+                else str(cluster.dependence_type)
+            )
+            det_method = (
+                cluster.primary_detection_method.value
+                if hasattr(cluster.primary_detection_method, "value")
+                else str(cluster.primary_detection_method)
+            )
+            avg_sim = cluster.average_similarity
+            members = cluster.member_source_ids
+        else:
+            c_id = cluster["cluster_id"]
+            can_id = cluster["canonical_source_id"]
+            desc = cluster.get("description")
+            c_at = cluster.get("created_at")
+            dep_type = cluster.get("dependence_type")
+            det_method = cluster.get("primary_detection_method")
+            avg_sim = cluster.get("average_similarity", 1.0)
+            members = cluster.get("member_source_ids", set())
+
+        self.create_origin_group(
+            group_id=c_id,
+            canonical_source_id=can_id,
+            description=desc,
+            created_at=c_at,
+            dependence_type=dep_type,
+            primary_detection_method=det_method,
+            average_similarity=avg_sim,
+        )
+
+        for s_id in members:
+            self.add_origin_member(c_id, s_id)
+
+        return self.get_origin_group(c_id) or {}
+
+    def get_syndication_groups(self) -> Dict[str, Set[str]]:
+        """Return all syndication origin groups as a mapping from group_id to a set of member source_ids."""
+        cursor = self.conn.execute("SELECT group_id, source_id FROM evidence_origin_members ORDER BY group_id;")
+        groups: Dict[str, Set[str]] = {}
+        for row in cursor.fetchall():
+            gid = row["group_id"]
+            sid = row["source_id"]
+            groups.setdefault(gid, set()).add(sid)
+        return groups

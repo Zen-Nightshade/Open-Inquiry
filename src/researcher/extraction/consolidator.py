@@ -118,9 +118,13 @@ class FactConsolidator:
                     new_fact=new_fact,
                     match_fact_id=matched_fact_id,
                     is_independent=is_independent,
+                    syndication_groups=syndication_groups,
                 )
             else:
-                accumulator.merge_or_add_fact(new_fact=new_fact)
+                accumulator.merge_or_add_fact(
+                    new_fact=new_fact,
+                    syndication_groups=syndication_groups,
+                )
 
         return FactConsolidationResult(
             consolidated_facts=list(accumulator.facts),
