@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from typing import Any, List, Optional
 import pytest
@@ -635,3 +636,156 @@ def test_orchestrator_preserves_research_and_strategy_on_generator_failure():
         assert db_run is not None
         assert db_run["status"] == RunStatus.FAILED.value
         assert db_run["strategy_result_json"] is not None
+
+
+def test_service_verifier_integration_populates_claim_verifications_and_quality_evaluation():
+    with tempfile.NamedTemporaryFile() as tf:
+        store = StateStore(tf.name)
+        store.initialize()
+
+        generator = MockGenerator()
+        service = EmailGenerationService(generator=generator, linter=ReadabilityLinter(), state_store=store)
+
+        prospect = _make_dummy_prospect()
+        product = _make_dummy_product()
+        strat_res = _make_dummy_strategy_result()
+        outreach = _make_dummy_outreach()
+
+        draft = service.generate_draft(
+            prospect=prospect,
+            product=product,
+            strategy_result=strat_res,
+            outreach=outreach,
+        )
+
+        assert isinstance(draft, VerifiedOutreachDraft)
+        assert len(draft.claim_verifications) > 0
+        assert draft.verifier_result is not None
+        assert draft.verifier_result.passed is True
+
+        # Check DB persistence
+        with store.uow() as uow:
+            db_draft = uow.outreach.get_outreach_draft(draft.draft_id)
+            assert db_draft is not None
+            claim_verifs = json.loads(db_draft["claim_verifications"])
+            assert len(claim_verifs) > 0
+            quality_eval = json.loads(db_draft["quality_evaluation"])
+            assert "verifier" in quality_eval
+            assert quality_eval["verifier"]["passed"] is True
+
+
+def test_service_rewrite_triggered_by_verifier_error():
+    # Attempt 1 has fabricated product proof point (99% reduction) causing Gate 4 ERROR
+    bad_draft = RawEmailDraftOutput(
+        subject="Cluster Telemetry Inquiry",
+        body=(
+            "Elena, saw your team added 10,000 new compute nodes at Black Mesa.\n\n"
+            "We built PulseRadar to eliminate 99% of node latency with 10x throughput.\n\n"
+            "Are you open to comparing cluster telemetry benchmarks this week?"
+        ),
+    )
+    # Attempt 2 is clean
+    clean_draft = RawEmailDraftOutput(
+        subject="Cluster Telemetry Inquiry",
+        body=(
+            "Elena, saw your team added 10,000 new compute nodes at Black Mesa.\n\n"
+            "When clusters grow fast, tracking can create heavy system lag. We built PulseRadar to cut node latency by 50% without adding extra overhead to your stack.\n\n"
+            "Are you open to comparing cluster telemetry benchmarks this week?"
+        ),
+    )
+
+    generator = MockGenerator(outputs=[bad_draft, clean_draft])
+    service = EmailGenerationService(generator=generator, linter=ReadabilityLinter())
+
+    draft = service.generate_draft(
+        prospect=_make_dummy_prospect(),
+        product=_make_dummy_product(),
+        strategy_result=_make_dummy_strategy_result(),
+        outreach=_make_dummy_outreach(),
+    )
+
+    # Verifier error triggered rewrite
+    assert generator.call_count == 2
+    assert generator.last_rewrite_feedback is not None
+    assert any("UNSUPPORTED_PROOF_POINT" in f or "ProductCapabilityBounds" in f for f in generator.last_rewrite_feedback)
+    assert draft.generation_attempts == 2
+    assert draft.verifier_result is not None
+    assert draft.verifier_result.passed is True
+
+
+def test_service_verifier_error_after_rewrite_preserves_draft_for_human_review():
+    # Both attempts contain hard exclusion violation
+    bad_draft_1 = RawEmailDraftOutput(
+        subject="Cluster Telemetry Inquiry",
+        body="Elena, saw your team added 10,000 new compute nodes. PulseRadar supports on-premise OpenShift natively.",
+    )
+    bad_draft_2 = RawEmailDraftOutput(
+        subject="Cluster Telemetry Inquiry",
+        body="Elena, saw your team added 10,000 new compute nodes. PulseRadar still supports on-premise OpenShift natively.",
+    )
+
+    # Use product with hard exclusion
+    from src.context.models import CapabilityNode, ProductContract
+    cap = CapabilityNode(
+        capability_id="cap-1",
+        name="Node Latency Telemetry",
+        hard_exclusions=["on-premise OpenShift"],
+        verified_proof_points=["50% reduction in telemetry lag"],
+    )
+    contract = ProductContract(
+        product_name="PulseRadar",
+        contract_version="1.0.0",
+        description="Telemetry intelligence",
+        value_proposition="Reduces node latency by 50%",
+        capabilities=[cap],
+        hard_exclusions=["on-premise OpenShift"],
+    )
+    product = contract.to_context()
+
+    generator = MockGenerator(outputs=[bad_draft_1, bad_draft_2])
+    service = EmailGenerationService(generator=generator, linter=ReadabilityLinter())
+
+    draft = service.generate_draft(
+        prospect=_make_dummy_prospect(),
+        product=product,
+        strategy_result=_make_dummy_strategy_result(),
+        outreach=_make_dummy_outreach(),
+    )
+
+    # Generator called twice (max 1 rewrite)
+    assert generator.call_count == 2
+    assert draft.generation_attempts == 2
+    # Draft is still preserved in PENDING_REVIEW (fail-safe for human review)
+    assert draft.human_review_status == HumanReviewStatus.PENDING_REVIEW
+    assert any("HARD_EXCLUSION_VIOLATION" in reason for reason in draft.human_review_reasons)
+    assert draft.verifier_result.has_errors is True
+
+
+def test_orchestrator_stage_7_records_verifier_metadata():
+    with tempfile.NamedTemporaryFile() as tf:
+        store = StateStore(tf.name)
+        store.initialize()
+
+        researcher = MockResearcher(is_sufficient=True)
+        strat_service = MockStrategyService(_make_dummy_strategy_result(is_viable=True, has_toulmin=True))
+        email_service = EmailGenerationService(generator=MockGenerator(), linter=ReadabilityLinter(), state_store=store)
+
+        orchestrator = ApplicationOrchestrator(
+            state_store=store,
+            researcher=researcher,
+            strategy_service=strat_service,
+            email_service=email_service,
+        )
+
+        res = orchestrator.run(
+            prospect=_make_dummy_prospect(),
+            product=_make_dummy_product(),
+            outreach=_make_dummy_outreach(),
+        )
+
+        stage7 = next((s for s in res.stage_records if s.stage == StageIdentifier.EMAIL_GENERATION), None)
+        assert stage7 is not None
+        assert "verifier_passed" in stage7.details
+        assert stage7.details["verifier_passed"] is True
+        assert "claim_verifications_count" in stage7.details
+        assert stage7.details["claim_verifications_count"] > 0

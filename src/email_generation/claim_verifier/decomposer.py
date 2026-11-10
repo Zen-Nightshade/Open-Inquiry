@@ -33,7 +33,7 @@ class ClaimDecomposer:
         re.IGNORECASE,
     )
     CTA_QUESTION_PATTERN = re.compile(
-        r"(?:\?|are you open|would you be open|how are you|are you seeing|interested in|worth a quick|worth exploring|open to|let's connect|schedule|calendar)",
+        r"(?:\?|are you open|would you be open|how are you|are you seeing|interested in|worth a quick|worth exploring|open to|let's connect|schedule|calendar|let's|i'd love|i'd like|we'd like|feel free)",
         re.IGNORECASE,
     )
     NUMERICAL_PATTERN = re.compile(r"\b(?:\d+[\d,\.]*|\$\d+[\d,\.]*|\d+%\s*|\d+x)\b")
@@ -261,13 +261,22 @@ class ClaimDecomposer:
         if text_lower.startswith(("if ", "assuming ", "depending on ", "when ", "as ")):
             return ClaimCategory.MODALITY_HEDGE, ModalityLevel.CONDITIONAL, True, is_product
 
+        # Determine materiality: subject headers without verbs or numerical metrics are non-material topic labels
+        if section == ClaimSection.SUBJECT:
+            is_material = bool(re.search(
+                r"\b(?:\d+|is|are|was|were|have|has|had|saw|noticed|added|built|cut|reduced|raised|acquired|hiring|launched)\b",
+                text_lower,
+            ))
+        else:
+            is_material = True
+
         # 5. Product capability vs metric
         if is_product:
             if self.NUMERICAL_PATTERN.search(text):
-                return ClaimCategory.METRIC_IMPACT, modality, True, True
-            return ClaimCategory.PRODUCT_CAPABILITY, modality, True, True
+                return ClaimCategory.METRIC_IMPACT, modality, is_material, True
+            return ClaimCategory.PRODUCT_CAPABILITY, modality, is_material, True
 
         # 6. Prospect observation vs metric
         if self.NUMERICAL_PATTERN.search(text):
-            return ClaimCategory.METRIC_IMPACT, modality, True, False
-        return ClaimCategory.PROSPECT_OBSERVATION, modality, True, False
+            return ClaimCategory.METRIC_IMPACT, modality, is_material, False
+        return ClaimCategory.PROSPECT_OBSERVATION, modality, is_material, False

@@ -495,9 +495,13 @@ class ApplicationOrchestrator:
                         "draft_id": draft.draft_id,
                         "word_count": draft.draft.word_count,
                         "linter_passed": draft.linter_result.passed if draft.linter_result else None,
+                        "verifier_passed": getattr(draft.verifier_result, "passed", None) if getattr(draft, "verifier_result", None) else None,
+                        "claim_verifications_count": len(draft.claim_verifications),
                         "human_review_status": draft.human_review_status.value,
                     }
-                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings):
+                    has_verifier_warnings = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "has_warnings", False))
+                    has_unverified_claims = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "unverified_claim_ids", []))
+                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings) or has_verifier_warnings or has_unverified_claims:
                         final_status = RunStatus.COMPLETED_WITH_WARNINGS
                     else:
                         final_status = RunStatus.COMPLETED

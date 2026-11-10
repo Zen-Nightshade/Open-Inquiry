@@ -85,6 +85,8 @@ class ClaimVerifierService:
             ent_res, ent_findings = self.entailment_gate.verify(
                 claims=all_claims,
                 research_package=research_package,
+                toulmin_argument=toulmin,
+                strategy=strategy,
             )
             entailment_results.extend(ent_res)
             all_findings.extend(ent_findings)

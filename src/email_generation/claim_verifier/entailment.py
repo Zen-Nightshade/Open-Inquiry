@@ -19,7 +19,8 @@ from src.generator.engine.request import GenerationRequest
 from src.generator.prompting.message import Message, Role
 from src.generator.prompting.prompt import Prompt
 from src.generator.structured_output.pydantic_parser import PydanticParser
-from src.researcher.models import CanonicalFact, EvidenceRecord, ResearchPackage
+from src.researcher.models import CanonicalFact, ConfidenceLevel, EvidenceRecord, ResearchPackage
+from src.signal_strategy.models import OutreachStrategy, ToulminArgument
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class FactEntailmentGate:
     """
 
     NEGATION_WORDS = {"delayed", "cancelled", "canceled", "failed", "postponed", "halted", "stopped", "rejected", "declined", "never", "not"}
+    NUMERICAL_REGEX = re.compile(r"\b(?:\d+[\d,\.]*|\$\d+[\d,\.]*|\d+%\s*|\d+x)\b")
 
     def __init__(
         self,
@@ -56,10 +58,46 @@ class FactEntailmentGate:
         self,
         claims: List[DecomposedClaim],
         research_package: Optional[ResearchPackage],
+        toulmin_argument: Optional[ToulminArgument] = None,
+        strategy: Optional[OutreachStrategy] = None,
     ) -> Tuple[List[EntailmentCheckResult], List[VerificationFinding]]:
         """Verify prospect-facing claims against canonical facts and evidence records."""
         results: List[EntailmentCheckResult] = []
         findings: List[VerificationFinding] = []
+
+        if (not research_package or not research_package.facts) and (toulmin_argument or strategy):
+            grounds_text = ""
+            if toulmin_argument and toulmin_argument.grounds and toulmin_argument.grounds.observed_event:
+                grounds_text += toulmin_argument.grounds.observed_event + ". "
+            if strategy and getattr(strategy, "primary_signal", None) and getattr(strategy.primary_signal, "signal", None):
+                sig = strategy.primary_signal.signal
+                grounds_text += f"{sig.label}. {sig.observed_event}. {sig.description}."
+            if not grounds_text and strategy:
+                grounds_text = strategy.central_message or ""
+
+            if grounds_text:
+                fact_id = (
+                    toulmin_argument.grounds.fact_ids[0]
+                    if (toulmin_argument and toulmin_argument.grounds and toulmin_argument.grounds.fact_ids)
+                    else "fact-grounds"
+                )
+                conf = (
+                    toulmin_argument.grounds.composite_confidence
+                    if (toulmin_argument and toulmin_argument.grounds)
+                    else ConfidenceLevel.HIGH
+                )
+                ev = EvidenceRecord(
+                    evidence_id="ev-grounds",
+                    source_id="src-grounds",
+                    verbatim_excerpt=grounds_text,
+                    confidence=conf,
+                )
+                fact = CanonicalFact(
+                    fact_id=fact_id,
+                    claim_text=grounds_text,
+                    evidence_records=[ev],
+                )
+                research_package = ResearchPackage(facts=(fact,))
 
         if not research_package or not research_package.facts:
             # No research package available -> all prospect observations are unsupported
@@ -178,32 +216,31 @@ class FactEntailmentGate:
         claim: DecomposedClaim,
         all_facts: Sequence[CanonicalFact],
     ) -> Tuple[List[CanonicalFact], bool]:
-        """Tier 1: Filter facts by entity/keyword overlap and check deterministic polarity."""
+        """Tier 1: Filter facts by entity/keyword overlap, numerical tokens, and check deterministic polarity."""
         claim_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", claim.text.lower()))
-        # Remove common stop words
         stop_words = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "are", "saw", "team", "your"}
         meaningful_tokens = claim_tokens - stop_words
+        clean_stems = {w.rstrip("s").rstrip("ed").rstrip("ing") for w in meaningful_tokens if len(w) > 2}
+        claim_nums = set(self.NUMERICAL_REGEX.findall(claim.text))
 
         matched_facts: List[CanonicalFact] = []
         polarity_contradiction = False
 
         for f in all_facts:
-            fact_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", f.claim_text.lower()))
-            overlap = meaningful_tokens.intersection(fact_tokens)
+            all_fact_text = f.claim_text + " " + " ".join(ev.verbatim_excerpt for ev in f.evidence_records)
+            fact_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", all_fact_text.lower()))
+            fact_stems = {w.rstrip("s").rstrip("ed").rstrip("ing") for w in fact_tokens if len(w) > 2}
+            fact_nums = set(self.NUMERICAL_REGEX.findall(all_fact_text))
 
-            # Check evidence excerpts as well
-            ev_overlap = any(
-                bool(meaningful_tokens.intersection(set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", ev.verbatim_excerpt.lower()))))
-                for ev in f.evidence_records
-            )
+            overlap = clean_stems.intersection(fact_stems)
+            num_overlap = claim_nums.intersection(fact_nums)
 
-            if len(overlap) >= 1 or ev_overlap:
+            if len(overlap) >= 1 or num_overlap:
                 matched_facts.append(f)
                 # Check for negation conflict
                 fact_negations = fact_tokens.intersection(self.NEGATION_WORDS)
                 claim_negations = claim_tokens.intersection(self.NEGATION_WORDS)
                 if (fact_negations and not claim_negations) or (claim_negations and not fact_negations):
-                    # Check if they share critical nouns (e.g. migration, deployment, acquisition)
                     nouns = overlap - self.NEGATION_WORDS
                     if len(nouns) >= 1:
                         polarity_contradiction = True
@@ -388,19 +425,37 @@ class FactEntailmentGate:
         """Deterministic rule-based entailment check for offline testing."""
         findings: List[VerificationFinding] = []
 
-        # Check if candidate facts corroborate the claim keywords
-        claim_words = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", claim.text.lower()))
+        claim_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", claim.text.lower()))
         stop_words = {"the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "is", "are", "saw", "team", "your"}
-        claim_keywords = claim_words - stop_words
+        claim_keywords = claim_tokens - stop_words
+        claim_stems = {w.rstrip("s").rstrip("ed").rstrip("ing") for w in claim_keywords if len(w) > 2}
+        claim_nums = set(self.NUMERICAL_REGEX.findall(claim.text))
 
         matched_fids: List[str] = []
         matched_eids: List[str] = []
 
         for f in candidate_facts:
-            f_words = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", f.claim_text.lower()))
-            # If 50% or more of keywords match fact or evidence
-            overlap = claim_keywords.intersection(f_words)
-            if len(overlap) >= max(1, len(claim_keywords) // 2):
+            all_fact_text = f.claim_text + " " + " ".join(ev.verbatim_excerpt for ev in f.evidence_records)
+            fact_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", all_fact_text.lower()))
+            fact_stems = {w.rstrip("s").rstrip("ed").rstrip("ing") for w in fact_tokens if len(w) > 2}
+            fact_nums = set(self.NUMERICAL_REGEX.findall(all_fact_text))
+
+            overlap = claim_stems.intersection(fact_stems)
+            nums_overlap = claim_nums.intersection(fact_nums)
+
+            # Match if:
+            # 1. Exact numerical metric matches + at least 1 keyword stem matches, OR
+            # 2. At least 2 keyword stems match, OR
+            # 3. >= 35% of claim keywords match
+            is_match = False
+            if nums_overlap and len(overlap) >= 1:
+                is_match = True
+            elif len(overlap) >= 2:
+                is_match = True
+            elif len(claim_keywords) > 0 and len(overlap) / len(claim_keywords) >= 0.35:
+                is_match = True
+
+            if is_match:
                 matched_fids.append(f.fact_id)
                 for ev in f.evidence_records:
                     if ev.evidence_id not in matched_eids:

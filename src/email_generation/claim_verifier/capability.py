@@ -46,6 +46,14 @@ class ProductCapabilityBoundsGate:
         if target_cap_id:
             target_cap = next((c for c in contract.capabilities if c.capability_id == target_cap_id), None)
 
+        if not target_cap and toulmin_argument and toulmin_argument.warrant and toulmin_argument.warrant.capability_name:
+            target_cap = CapabilityNode(
+                capability_id=toulmin_argument.warrant.capability_id or "cap-toulmin",
+                name=toulmin_argument.warrant.capability_name,
+                description=toulmin_argument.warrant.reasoning,
+                verified_proof_points=list(toulmin_argument.backing.whitelisted_proof_points) if toulmin_argument.backing else [],
+            )
+
         product_claims = [
             c for c in claims
             if (c.is_product_claim or c.category == ClaimCategory.PRODUCT_CAPABILITY)

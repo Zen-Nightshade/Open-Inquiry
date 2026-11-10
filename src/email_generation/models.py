@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.common.provenance import OutputProvenance
@@ -163,6 +163,10 @@ class VerifiedOutreachDraft(BaseModel):
     linter_result: Optional[LinterResult] = Field(
         default=None,
         description="Authoritative outcome and findings of the readability and quality linter",
+    )
+    verifier_result: Optional[Any] = Field(
+        default=None,
+        description="Authoritative outcome and findings of the four-gate claim and capability verifier",
     )
     selected_cta: Optional[CTAType] = Field(
         default=None,

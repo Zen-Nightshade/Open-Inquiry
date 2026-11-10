@@ -1,3 +1,21 @@
+from .claim_verifier import (
+    CapabilityCheckResult,
+    ClaimCategory,
+    ClaimDecomposer,
+    ClaimSection,
+    ClaimVerifierService,
+    DecomposedClaim,
+    EntailmentCheckResult,
+    EntailmentVerdict,
+    FactEntailmentGate,
+    ModalityCheckResult,
+    ModalityLevel,
+    ModalityPreservationGate,
+    ProductCapabilityBoundsGate,
+    VerificationFinding,
+    VerifierFindingSeverity,
+    VerifierResult,
+)
 from .generator import EmailGenerationError, EmailGenerator
 from .linter import ReadabilityLinter
 from .models import (
@@ -36,4 +54,20 @@ __all__ = [
     "EmailGenerationError",
     "EmailGenerationService",
     "DraftPersistenceError",
+    "ClaimVerifierService",
+    "ClaimDecomposer",
+    "FactEntailmentGate",
+    "ModalityPreservationGate",
+    "ProductCapabilityBoundsGate",
+    "ClaimCategory",
+    "ClaimSection",
+    "EntailmentVerdict",
+    "ModalityLevel",
+    "VerifierFindingSeverity",
+    "VerificationFinding",
+    "DecomposedClaim",
+    "EntailmentCheckResult",
+    "ModalityCheckResult",
+    "CapabilityCheckResult",
+    "VerifierResult",
 ]
