@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.config.settings import GROQ_SMALL
 from src.generator.decoding import DecodeConfig
 from src.generator.engine.engine import GeneratorEngine
@@ -29,6 +30,7 @@ from src.researcher.models import (
     FactCategory,
     SourceRecord,
 )
+from src.researcher.molecular_transformer import MolecularTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -214,11 +216,13 @@ class FactExtractor:
         engine: Optional[GeneratorEngine] = None,
         validator: Optional[ExcerptValidator] = None,
         provider_name: Optional[str] = None,
+        transformer: Optional[MolecularTransformer] = None,
     ) -> None:
         self.provider_name = provider_name or GROQ_SMALL
         self.engine = engine or GeneratorEngine(default_provider=self.provider_name)
         self.validator = validator or ExcerptValidator()
         self.parser = PydanticParser(FactExtractionOutput)
+        self.transformer = transformer or MolecularTransformer()
 
     def extract(
         self,
@@ -280,6 +284,9 @@ class FactExtractor:
         raw_facts: List[RawExtractedFact] = response.parsed_output.facts
         logger.info("LLM generated %d raw facts for source %s. Validating excerpts...", len(raw_facts), source_id)
 
+        model_exec_id = response.metadata.get("execution_id") if hasattr(response, "metadata") and response.metadata else None
+        model_name = getattr(response, "model_name", None)
+
         # 3. Deterministic Excerpt Validation & CanonicalFact Construction
         validated_facts: List[CanonicalFact] = []
         today = datetime.date.today()
@@ -327,15 +334,41 @@ class FactExtractor:
 
             primary_date = parse_iso_date(raw_fact.primary_event_date) or valid_evidence_records[0].event_date
 
+            fact_id = str(uuid.uuid4())
             canonical_fact = CanonicalFact(
-                fact_id=str(uuid.uuid4()),
+                fact_id=fact_id,
                 claim_text=raw_fact.claim_text.strip(),
                 fact_category=raw_fact.fact_category,
                 entity_ids=entity_ids,
                 evidence_records=valid_evidence_records,
                 primary_event_date=primary_date,
                 composite_confidence=raw_fact.confidence,
+                provenance=OutputProvenance(
+                    origin=ProvenanceOrigin.MODEL,
+                    component="fact_extractor",
+                    model_name=model_name,
+                    provider=self.provider_name,
+                    model_execution_id=model_exec_id,
+                ),
             )
+            # Transform and decompose into atomic molecular propositions
+            mol_facts = self.transformer.transform(
+                canonical_fact,
+                subject_name_override=raw_fact.subject_entity_name,
+                subject_entity_id=entity_ids[0] if entity_ids else None,
+            )
+            if mol_facts:
+                canonical_fact = CanonicalFact(
+                    fact_id=canonical_fact.fact_id,
+                    claim_text=canonical_fact.claim_text,
+                    fact_category=canonical_fact.fact_category,
+                    entity_ids=canonical_fact.entity_ids,
+                    evidence_records=canonical_fact.evidence_records,
+                    primary_event_date=canonical_fact.primary_event_date,
+                    composite_confidence=canonical_fact.composite_confidence,
+                    provenance=canonical_fact.provenance,
+                    molecular_facts=mol_facts,
+                )
             validated_facts.append(canonical_fact)
 
         logger.info(

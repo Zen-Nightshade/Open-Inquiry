@@ -141,6 +141,23 @@ def _ensure_human_review_events_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_canonical_facts_molecular_columns(conn: sqlite3.Connection) -> None:
+    """Ensure newly added molecular columns exist on canonical_facts table idempotently."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(canonical_facts);")
+    cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if not cols:
+        return
+
+    columns_to_add = [
+        ("molecular_data_json", "TEXT"),
+    ]
+    for col_name, col_def in columns_to_add:
+        if col_name not in cols:
+            conn.execute(f"ALTER TABLE canonical_facts ADD COLUMN {col_name} {col_def};")
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Execute the authoritative schema script against the provided connection idempotently.
     
@@ -155,6 +172,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _ensure_application_runs_columns(conn)
         _ensure_outreach_drafts_columns(conn)
         _ensure_human_review_events_columns(conn)
+        _ensure_canonical_facts_molecular_columns(conn)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize database schema: {exc}") from exc
 

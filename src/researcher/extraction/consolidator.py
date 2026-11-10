@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.researcher.contradiction_detector import ContradictionDetector, ContradictionStatus
 from src.researcher.extraction.assessment import EvidenceAssessor
 from src.researcher.models import (
     CanonicalFact,
@@ -57,8 +58,13 @@ def extract_numerical_tokens(text: str) -> Set[str]:
 class FactConsolidator:
     """Consolidates new facts into the research accumulator, detecting syndication duplicates and conflicts."""
 
-    def __init__(self, assessor: Optional[EvidenceAssessor] = None) -> None:
+    def __init__(
+        self,
+        assessor: Optional[EvidenceAssessor] = None,
+        detector: Optional[ContradictionDetector] = None,
+    ) -> None:
         self.assessor = assessor or EvidenceAssessor()
+        self.detector = detector or ContradictionDetector()
 
     def consolidate(
         self,
@@ -183,6 +189,16 @@ class FactConsolidator:
 
         if not (set(fact_a.entity_ids) & set(fact_b.entity_ids)):
             return None
+
+        # 0. Check structured molecular proposition contradiction if available
+        if fact_a.molecular_facts and fact_b.molecular_facts:
+            for mol_a in fact_a.molecular_facts:
+                for mol_b in fact_b.molecular_facts:
+                    eval_res = self.detector.evaluate(mol_a, mol_b)
+                    if eval_res.status == ContradictionStatus.CONTRADICTION:
+                        return (eval_res.reason, ConflictSeverity.CONFIRMED)
+                    elif eval_res.status == ContradictionStatus.POTENTIAL_CONTRADICTION:
+                        return (eval_res.reason, ConflictSeverity.POTENTIAL)
 
         text_a = fact_a.claim_text.lower().strip()
         text_b = fact_b.claim_text.lower().strip()

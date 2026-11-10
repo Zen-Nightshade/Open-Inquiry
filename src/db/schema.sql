@@ -416,6 +416,7 @@ CREATE TABLE IF NOT EXISTS canonical_facts (
     fact_category        TEXT NOT NULL DEFAULT 'other',
     primary_event_date   TEXT,
     composite_confidence TEXT NOT NULL DEFAULT 'medium',
+    molecular_data_json  TEXT,
     created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_facts_session ON canonical_facts(session_id);

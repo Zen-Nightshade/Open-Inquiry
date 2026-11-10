@@ -20,17 +20,19 @@ class AssertionRepository:
         fact_category: str = "other",
         primary_event_date: Optional[str] = None,
         composite_confidence: str = "medium",
+        molecular_data_json: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = created_at or datetime.now(timezone.utc).isoformat()
         sql = """
         INSERT INTO canonical_facts (
             fact_id, session_id, claim_text, fact_category,
-            primary_event_date, composite_confidence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            primary_event_date, composite_confidence, molecular_data_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fact_id) DO UPDATE SET
             composite_confidence = excluded.composite_confidence,
-            primary_event_date = coalesce(canonical_facts.primary_event_date, excluded.primary_event_date);
+            primary_event_date = coalesce(canonical_facts.primary_event_date, excluded.primary_event_date),
+            molecular_data_json = coalesce(excluded.molecular_data_json, canonical_facts.molecular_data_json);
         """
         self.conn.execute(
             sql,
@@ -41,6 +43,7 @@ class AssertionRepository:
                 fact_category,
                 primary_event_date,
                 composite_confidence,
+                molecular_data_json,
                 now,
             ),
         )

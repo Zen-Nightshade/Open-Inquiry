@@ -20,6 +20,10 @@ from src.researcher.models import (
     FactCategory,
     ResearchAccumulator,
 )
+from src.researcher.molecular_models import (
+    deserialize_molecular_facts,
+    serialize_molecular_facts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,7 @@ class FactExtractionService:
                             else None
                         ),
                         composite_confidence=ConfidenceLevel(df["composite_confidence"]),
+                        molecular_facts=deserialize_molecular_facts(df.get("molecular_data_json")),
                     )
                     active_acc.facts.append(c_fact)
 
@@ -143,6 +148,11 @@ class FactExtractionService:
                         fact.primary_event_date.isoformat() if fact.primary_event_date else None
                     ),
                     composite_confidence=fact.composite_confidence.value,
+                    molecular_data_json=(
+                        serialize_molecular_facts(fact.molecular_facts)
+                        if fact.molecular_facts
+                        else None
+                    ),
                 )
 
                 # 2. Link fact to entities

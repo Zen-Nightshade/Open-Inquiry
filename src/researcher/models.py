@@ -4,8 +4,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Any, List, Optional, Sequence, Set, Tuple
 from pydantic import BaseModel, ConfigDict, Field
+
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 
 
 class EntityType(str, Enum):
@@ -78,6 +80,7 @@ class EntityRecord(BaseModel):
     )
     confidence: ConfidenceLevel = Field(default=ConfidenceLevel.UNRESOLVED)
     disambiguation_notes: Optional[str] = Field(default=None, description="Notes on resolution confidence or ambiguity")
+    provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and producing component metadata")
 
 
 class SourceRecord(BaseModel):
@@ -140,6 +143,11 @@ class CanonicalFact(BaseModel):
     )
     primary_event_date: Optional[date] = Field(default=None, description="Consensus event date")
     composite_confidence: ConfidenceLevel = Field(default=ConfidenceLevel.MEDIUM)
+    provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and producing component metadata")
+    molecular_facts: Tuple[Any, ...] = Field(
+        default=(),
+        description="Atomic molecular propositions representing this claim; empty if un-decomposed",
+    )
 
     @property
     def source_ids(self) -> List[str]:
@@ -161,6 +169,7 @@ class SufficiencyResult(BaseModel):
     has_commercial_signal: bool
     coverage_gaps: Tuple[str, ...] = Field(default=())
     stop_reason: str = Field(default="sufficient", description="Reason for stopping or continuing")
+    provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and producing component metadata")
 
 
 class ResearchPackage(BaseModel):
@@ -253,6 +262,7 @@ class ResearchAccumulator:
                         evidence_records=merged_evidence,
                         primary_event_date=existing.primary_event_date or new_fact.primary_event_date,
                         composite_confidence=composite_conf,
+                        molecular_facts=existing.molecular_facts or new_fact.molecular_facts,
                     )
                     self.facts[idx] = updated
                     return
