@@ -30,7 +30,7 @@ from src.researcher.models import (
 logger = logging.getLogger(__name__)
 
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class AffiliationData(BaseModel):
@@ -95,6 +95,39 @@ class IdentityAssessmentOutput(BaseModel):
         description="Notes detailing why candidates were selected or rejected, and any ambiguity",
     )
     conflicts_or_ambiguities: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_root_payload(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        # Unnest if wrapped under sub-keys
+        for key in ("assessment", "identity_assessment", "result", "identity_resolution"):
+            if key in data and isinstance(data[key], dict):
+                merged = dict(data[key])
+                for k, v in data.items():
+                    if k != key and k not in merged:
+                        merged[k] = v
+                data = merged
+                break
+
+        if "resolution_status" not in data:
+            status_val = data.get("status") or (data.get("target_identity", {}).get("status") if isinstance(data.get("target_identity"), dict) else None)
+            data["resolution_status"] = status_val or ResolutionStatus.UNRESOLVED
+
+        if "confidence" not in data:
+            data["confidence"] = data.get("confidence_level") or ConfidenceLevel.LOW
+
+        if "rationale" not in data:
+            data["rationale"] = (
+                data.get("reasoning")
+                or data.get("explanation")
+                or data.get("notes")
+                or "Evaluated candidates against target context."
+            )
+
+        return data
 
     @field_validator("rationale", mode="before")
     @classmethod
@@ -324,8 +357,17 @@ class IdentityResolver:
 
         lines.append(
             "Evaluate these candidates against the target. Determine resolution status, confidence, "
-            "matched candidate IDs, canonical names, aliases, affiliations (with temporal dates), "
-            "and detailed rationale."
+            "matched candidate IDs, canonical names, aliases, affiliations, and detailed rationale.\n\n"
+            "Output MUST be a JSON object with this exact structure:\n"
+            "{\n"
+            '  "resolution_status": "resolved" | "partially_resolved" | "ambiguous" | "unresolved",\n'
+            '  "confidence": "high" | "medium" | "low" | "unresolved",\n'
+            '  "matched_candidate_ids": ["string"],\n'
+            '  "prospect_canonical_name": "string",\n'
+            '  "company_canonical_name": "string",\n'
+            '  "rationale": "string",\n'
+            '  "disambiguation_notes": "string"\n'
+            "}"
         )
         return "\n".join(lines)
 

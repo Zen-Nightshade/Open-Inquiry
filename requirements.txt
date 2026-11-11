@@ -15,11 +15,6 @@ dateparser>=1.5.0
 # Search
 duckduckgo-search>=8.0.0
 
-# ML & NLP
-sentence-transformers>=6.0.0
-faiss-cpu>=1.9.0
-rank-bm25>=0.2.2
-
 # Configuration, Utilities & Resilience
 pydantic>=2.14.0
 pydantic-settings>=2.0.0
@@ -34,3 +29,6 @@ pytest-mock>=3.0.0
 # API & Server
 fastapi>=0.115.0
 uvicorn>=0.30.0
+
+# UI & Deployment
+streamlit>=1.40.0

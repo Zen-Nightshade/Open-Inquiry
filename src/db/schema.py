@@ -145,6 +145,7 @@ def _ensure_outreach_drafts_check_constraint(conn: sqlite3.Connection) -> None:
         return
 
     cursor.execute("PRAGMA foreign_keys = OFF;")
+    cursor.execute("PRAGMA legacy_alter_table = ON;")
     cursor.execute("ALTER TABLE outreach_drafts RENAME TO _outreach_drafts_old;")
     cursor.execute("""
     CREATE TABLE outreach_drafts (
@@ -180,6 +181,7 @@ def _ensure_outreach_drafts_check_constraint(conn: sqlite3.Connection) -> None:
     cursor.execute("DROP TABLE _outreach_drafts_old;")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_outreach_drafts_context ON outreach_drafts(context_id);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_outreach_drafts_session ON outreach_drafts(research_session_id);")
+    cursor.execute("PRAGMA legacy_alter_table = OFF;")
     cursor.execute("PRAGMA foreign_keys = ON;")
     conn.commit()
 
@@ -211,6 +213,96 @@ def _ensure_human_review_events_columns(conn: sqlite3.Connection) -> None:
         if col_name not in cols:
             conn.execute(f"ALTER TABLE human_review_events ADD COLUMN {col_name} {col_def};")
     conn.commit()
+
+
+def _ensure_human_review_events_clean_fk(conn: sqlite3.Connection) -> None:
+    """Ensure human_review_events references outreach_drafts and not a dropped temporary table."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_key_list(human_review_events);")
+    fks = cursor.fetchall()
+    needs_rebuild = False
+    for row in fks:
+        table_ref = row["table"] if isinstance(row, sqlite3.Row) else row[2]
+        if "_outreach_drafts_old" in str(table_ref):
+            needs_rebuild = True
+            break
+    if not needs_rebuild:
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF;")
+    conn.execute("DROP VIEW IF EXISTS review_events;")
+    conn.execute("DROP TRIGGER IF EXISTS prevent_human_review_events_update;")
+    conn.execute("DROP TRIGGER IF EXISTS prevent_human_review_events_delete;")
+    conn.execute("DROP TABLE IF EXISTS human_review_events_new;")
+    conn.execute("""
+        CREATE TABLE human_review_events_new (
+            event_id              TEXT PRIMARY KEY,
+            draft_id              TEXT NOT NULL REFERENCES outreach_drafts(draft_id) ON DELETE CASCADE,
+            action                TEXT NOT NULL DEFAULT 'APPROVED'
+                CHECK (action IN ('APPROVED', 'REJECTED', 'EDITED')),
+            decision              TEXT,
+            reviewed_revision     INTEGER NOT NULL DEFAULT 1,
+            resulting_revision    INTEGER NOT NULL DEFAULT 1,
+            reviewer_id           TEXT,
+            notes                 TEXT,
+            reason_code           TEXT
+                CHECK (reason_code IS NULL OR reason_code IN ('HALLUCINATION', 'TONE_MISMATCH', 'WRONG_CAPABILITY', 'TIMING_IRRELEVANCE', 'INSUFFICIENT_PERSONALIZATION', 'OTHER')),
+            original_subject      TEXT,
+            original_body         TEXT,
+            resulting_subject     TEXT,
+            resulting_body        TEXT,
+            char_edit_distance    INTEGER,
+            word_edit_distance    INTEGER,
+            normalized_char_ratio REAL,
+            normalized_word_ratio REAL,
+            decided_at            TEXT NOT NULL
+        );
+    """)
+    conn.execute("INSERT OR IGNORE INTO human_review_events_new SELECT * FROM human_review_events;")
+    conn.execute("DROP TABLE human_review_events;")
+    conn.execute("ALTER TABLE human_review_events_new RENAME TO human_review_events;")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_draft ON human_review_events(draft_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_action ON human_review_events(action);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_human_review_events_decided ON human_review_events(decided_at);")
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_human_review_events_update
+        BEFORE UPDATE ON human_review_events
+        BEGIN
+            SELECT RAISE(ABORT, 'human_review_events is append-only; updates are not permitted');
+        END;
+    """)
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_human_review_events_delete
+        BEFORE DELETE ON human_review_events
+        BEGIN
+            SELECT RAISE(ABORT, 'human_review_events is append-only; deletions are not permitted');
+        END;
+    """)
+    conn.execute("""
+        CREATE VIEW IF NOT EXISTS review_events AS
+        SELECT
+            event_id,
+            draft_id,
+            action,
+            reviewed_revision,
+            resulting_revision,
+            reviewer_id,
+            notes,
+            reason_code,
+            original_subject,
+            original_body,
+            resulting_subject,
+            resulting_body,
+            char_edit_distance,
+            word_edit_distance,
+            normalized_char_ratio,
+            normalized_word_ratio,
+            decided_at AS timestamp
+        FROM human_review_events;
+    """)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.commit()
+
 
 
 def _ensure_canonical_facts_molecular_columns(conn: sqlite3.Connection) -> None:
@@ -426,12 +518,26 @@ def init_schema(conn: sqlite3.Connection) -> None:
     schema_sql = load_schema_sql()
 
     try:
+        # Pre-migrate columns for existing tables so indexes referencing new columns succeed
+        _ensure_model_executions_columns(conn)
+        _ensure_application_runs_columns(conn)
+        _ensure_outreach_drafts_columns(conn)
+        _ensure_human_review_events_columns(conn)
+        _ensure_human_review_events_clean_fk(conn)
+        _ensure_source_snapshots_syndication_columns(conn)
+        _ensure_canonical_facts_molecular_columns(conn)
+        _ensure_canonical_facts_bitemporal_columns(conn)
+        _ensure_evidence_origin_columns(conn)
+        _ensure_canonical_facts_syndication_columns(conn)
+        _ensure_entity_resolution_columns(conn)
+
         conn.executescript(schema_sql)
         _ensure_model_executions_columns(conn)
         _ensure_application_runs_columns(conn)
         _ensure_outreach_drafts_columns(conn)
         _ensure_outreach_drafts_check_constraint(conn)
         _ensure_human_review_events_columns(conn)
+        _ensure_human_review_events_clean_fk(conn)
         _ensure_canonical_facts_molecular_columns(conn)
         _ensure_canonical_facts_bitemporal_columns(conn)
         _ensure_source_snapshots_syndication_columns(conn)

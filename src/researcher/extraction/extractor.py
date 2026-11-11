@@ -259,7 +259,7 @@ class FactExtractor:
 
         decoding = DecodeConfig(
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=4096,
         )
 
         request = GenerationRequest(
