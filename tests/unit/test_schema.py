@@ -12,8 +12,12 @@ from src.context.models import OutreachContext, ProductContext, ProspectContext
 from src.db.connection import get_connection
 from src.db.schema import (
     EXPECTED_DOMAIN_TABLES,
+    FTS_VIRTUAL_TABLES,
+    check_fts_integrity,
     init_schema,
+    is_fts_table,
     load_schema_sql,
+    rebuild_fts_indexes,
     verify_schema,
 )
 from src.db.state_store import StateStore
@@ -161,14 +165,15 @@ def test_database_status_does_not_create_file(tmp_path: Path):
 
 
 def test_db_path_resolution_and_cwd_independence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Verify get_db_path resolves default to DATA_DIR/zamp.db and relative paths against REPO_ROOT."""
-    # 1. Default path without ZAMP_DB_PATH
+    """Verify get_db_path resolves default to DATA_DIR/open_inquiry.db and relative paths against REPO_ROOT."""
+    # 1. Default path without env vars
+    monkeypatch.delenv("OPEN_INQUIRY_DB_PATH", raising=False)
     monkeypatch.delenv("ZAMP_DB_PATH", raising=False)
     default_p = get_db_path()
-    assert default_p == DATA_DIR / "zamp.db"
+    assert default_p == DATA_DIR / "open_inquiry.db"
 
-    # 2. Relative ZAMP_DB_PATH should resolve relative to REPO_ROOT, regardless of CWD
-    monkeypatch.setenv("ZAMP_DB_PATH", "data/custom.db")
+    # 2. Relative OPEN_INQUIRY_DB_PATH should resolve relative to REPO_ROOT, regardless of CWD
+    monkeypatch.setenv("OPEN_INQUIRY_DB_PATH", "data/custom.db")
     custom_p = get_db_path()
     assert custom_p == (REPO_ROOT / "data" / "custom.db").resolve()
 
@@ -180,9 +185,9 @@ def test_db_path_resolution_and_cwd_independence(tmp_path: Path, monkeypatch: py
     finally:
         os.chdir(original_cwd)
 
-    # 3. Absolute ZAMP_DB_PATH
+    # 3. Absolute OPEN_INQUIRY_DB_PATH
     abs_path = (tmp_path / "absolute.db").resolve()
-    monkeypatch.setenv("ZAMP_DB_PATH", str(abs_path))
+    monkeypatch.setenv("OPEN_INQUIRY_DB_PATH", str(abs_path))
     assert get_db_path() == abs_path
 
 
@@ -196,7 +201,7 @@ def test_orchestrator_auto_initialization(tmp_path: Path):
 
     prospect = ProspectContext(full_name="Alex Rivera", company_name="Novatech")
     product = ProductContext(
-        product_name="Zamp",
+        product_name="Open Inquiry",
         description="Autonomous research engine",
         capabilities=["Research", "Signal Strategy"],
         value_proposition="AI research",
@@ -235,7 +240,7 @@ def test_orchestrator_incompatible_schema_preserves_database(tmp_path: Path):
 
     prospect = ProspectContext(full_name="Alex Rivera", company_name="Novatech")
     product = ProductContext(
-        product_name="Zamp",
+        product_name="Open Inquiry",
         description="Autonomous research engine",
         capabilities=["Research", "Signal Strategy"],
         value_proposition="AI research",
@@ -263,3 +268,48 @@ def test_orchestrator_incompatible_schema_preserves_database(tmp_path: Path):
     assert row is not None
     assert row[0] == "preserve_me"
     conn2.close()
+
+
+def test_fts5_schema_elements_and_integrity():
+    """Verify FTS5 virtual tables, sync triggers, is_fts_table predicate, and integrity checks."""
+    conn = sqlite3.connect(":memory:")
+    init_schema(conn)
+
+    # Verify is_fts_table classification
+    for v_table in FTS_VIRTUAL_TABLES:
+        assert is_fts_table(v_table) is True
+        assert is_fts_table(f"{v_table}_data") is True
+        assert is_fts_table(f"{v_table}_idx") is True
+        assert is_fts_table(f"{v_table}_config") is True
+        assert is_fts_table(f"{v_table}_docsize") is True
+
+    for d_table in EXPECTED_DOMAIN_TABLES:
+        assert is_fts_table(d_table) is False
+
+    # Verify virtual tables exist in sqlite_master
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('source_snapshots_fts', 'evidence_passages_fts');")
+    found_virtual = {r[0] for r in cur.fetchall()}
+    assert found_virtual == {"source_snapshots_fts", "evidence_passages_fts"}
+
+    # Verify synchronization triggers exist
+    cur.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '%_fts%' OR name LIKE '%source_snapshots_%' OR name LIKE '%evidence_passages_%';")
+    triggers = {r[0] for r in cur.fetchall()}
+    expected_triggers = {
+        "source_snapshots_ai",
+        "source_snapshots_ad",
+        "source_snapshots_au",
+        "evidence_passages_ai",
+        "evidence_passages_ad",
+        "evidence_passages_au",
+    }
+    assert expected_triggers.issubset(triggers)
+
+    # Verify rebuild and integrity checks pass
+    rebuild_fts_indexes(conn)
+    integrity = check_fts_integrity(conn)
+    assert integrity == {
+        "source_snapshots_fts": True,
+        "evidence_passages_fts": True,
+    }
+    conn.close()

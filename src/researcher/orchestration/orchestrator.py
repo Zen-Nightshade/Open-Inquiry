@@ -63,6 +63,7 @@ from src.researcher.epistemic_dag import (
     GlobalResearchBudget,
     QuestionLifecycleStatus,
 )
+from src.researcher.retrieval import HistoricalRetrievalService, RetrievedRecordType
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class Researcher:
         fact_service: Optional[FactExtractionService] = None,
         evaluator: Optional[ResearchSufficiencyEvaluator] = None,
         syndication_detector: Optional[SyndicationDetector] = None,
+        retrieval_service: Optional[HistoricalRetrievalService] = None,
     ) -> None:
         self.state_store = state_store
         self.planner = planner or ResearchPlanner()
@@ -93,6 +95,7 @@ class Researcher:
         self.fact_service = fact_service or FactExtractionService(state_store=self.state_store)
         self.evaluator = evaluator or ResearchSufficiencyEvaluator()
         self.syndication_detector = syndication_detector or SyndicationDetector()
+        self.retrieval_service = retrieval_service
 
     def conduct_research(
         self,
@@ -272,6 +275,41 @@ class Researcher:
                     if q.query_text not in accumulator.search_queries_used:
                         accumulator.search_queries_used.append(q.query_text)
 
+                # Step B0: Local Historical Lexical Retrieval (Zero budget consumption)
+                historical_snap_ids: List[str] = []
+                if self.retrieval_service is not None:
+                    for q in queries:
+                        try:
+                            ret_resp = self.retrieval_service.search(
+                                query=q.query_text,
+                                limit=max_results_per_query,
+                            )
+                            for item in ret_resp.items:
+                                if item.record_type == RetrievedRecordType.SOURCE_SNAPSHOT:
+                                    item_url = item.url or f"urn:snapshot:{item.record_id}"
+                                    if item_url not in accumulator.seen_urls:
+                                        fetch_d = datetime.now(timezone.utc).date()
+                                        if item.captured_at:
+                                            try:
+                                                fetch_d = datetime.fromisoformat(item.captured_at.split("T")[0]).date()
+                                            except Exception:
+                                                pass
+                                        hist_source = SourceRecord(
+                                            source_id=item.source_id,
+                                            url=item_url,
+                                            domain=item.domain or "historical.local",
+                                            title=item.title,
+                                            raw_text=item.raw_text,
+                                            fetch_date=fetch_d,
+                                            credibility_score=0.8,
+                                            credibility_rationale="Retrieved from historical source snapshots via local FTS5 lexical index",
+                                        )
+                                        accumulator.add_source(hist_source)
+                                        if item.record_id not in historical_snap_ids:
+                                            historical_snap_ids.append(item.record_id)
+                        except Exception as ret_err:
+                            logger.warning("Historical retrieval error for query '%s': %s", q.query_text, ret_err)
+
                 # Step B: Search Execution & Page Fetching
                 new_snapshot_ids = self._execute_searches_and_fetches(
                     session_id=active_session_id,
@@ -281,6 +319,9 @@ class Researcher:
                     max_pages=max_pages_to_fetch_per_iter,
                     budget=active_budget,
                 )
+                for h_id in historical_snap_ids:
+                    if h_id not in new_snapshot_ids:
+                        new_snapshot_ids.append(h_id)
 
                 # Step C: Entity Resolution
                 known_entities = self._run_entity_resolution(

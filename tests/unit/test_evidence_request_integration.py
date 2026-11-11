@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.context.models import OutreachContext, ProductContext, ProspectContext
-from src.db.schema import EXPECTED_DOMAIN_TABLES
+from src.db.schema import EXPECTED_DOMAIN_TABLES, is_fts_table
 from src.db.state_store import StateStore
 from src.orchestration.app_orchestrator import ApplicationOrchestrator
 from src.orchestration.models import RunStatus, StageIdentifier, StageStatus
@@ -422,6 +422,10 @@ def test_schema_36_tables_preserved_invariant():
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
             )
             tables = {row[0] for row in cursor.fetchall()}
+            domain_tables = {t for t in tables if not is_fts_table(t)}
+            fts_tables = {t for t in tables if is_fts_table(t)}
 
-        assert tables == EXPECTED_DOMAIN_TABLES
-        assert len(tables) == 36
+        assert domain_tables == EXPECTED_DOMAIN_TABLES
+        assert len(domain_tables) == 36
+        assert "source_snapshots_fts" in fts_tables
+        assert "evidence_passages_fts" in fts_tables

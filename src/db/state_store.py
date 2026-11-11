@@ -11,6 +11,7 @@ from src.db.connection import get_connection
 from src.db.schema import (
     EXPECTED_DOMAIN_TABLES,
     init_schema,
+    is_fts_table,
     verify_schema,
 )
 from src.db.unit_of_work import UnitOfWork
@@ -61,7 +62,9 @@ class StateStore:
             cursor.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
             )
-            tables = [row["name"] for row in cursor.fetchall()]
+            raw_tables = [row["name"] for row in cursor.fetchall()]
+            tables = [name for name in raw_tables if not is_fts_table(name)]
+            fts_tables = [name for name in raw_tables if is_fts_table(name)]
 
             if not tables:
                 return {
@@ -97,6 +100,7 @@ class StateStore:
                 "missing_tables": missing_tables,
                 "incompatibility_details": incompatibility_details,
                 "tables": tables,
+                "fts_tables": fts_tables,
             }
         finally:
             conn.close()

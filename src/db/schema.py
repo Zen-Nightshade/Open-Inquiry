@@ -48,6 +48,26 @@ EXPECTED_DOMAIN_TABLES: Set[str] = {
     "application_runs",
 }
 
+FTS_VIRTUAL_TABLES: Set[str] = {
+    "source_snapshots_fts",
+    "evidence_passages_fts",
+}
+
+FTS_SHADOW_SUFFIXES: Tuple[str, ...] = (
+    "_data",
+    "_idx",
+    "_docsize",
+    "_config",
+    "_content",
+)
+
+
+def is_fts_table(table_name: str) -> bool:
+    """Determine whether a table is an FTS5 virtual table or internal shadow table."""
+    return table_name in FTS_VIRTUAL_TABLES or any(
+        table_name.startswith(f"{v}_") for v in FTS_VIRTUAL_TABLES
+    )
+
 
 def load_schema_sql() -> str:
     """Read the complete authoritative database schema SQL."""
@@ -260,6 +280,92 @@ def _ensure_entity_resolution_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_fts_indexes(conn: sqlite3.Connection) -> None:
+    """Ensure SQLite FTS5 virtual tables and synchronization triggers exist."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _test_fts5_probe USING fts5(x);")
+        conn.execute("DROP TABLE IF EXISTS _test_fts5_probe;")
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(f"SQLite FTS5 extension is not available in current environment: {exc}") from exc
+
+    # 1. source_snapshots_fts external content virtual table
+    conn.execute("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS source_snapshots_fts USING fts5(
+        title,
+        raw_text,
+        content='source_snapshots',
+        content_rowid='rowid'
+    );
+    """)
+
+    # 2. evidence_passages_fts external content virtual table
+    conn.execute("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS evidence_passages_fts USING fts5(
+        verbatim_excerpt,
+        content='evidence_passages',
+        content_rowid='rowid'
+    );
+    """)
+
+    # 3. Triggers for source_snapshots
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS source_snapshots_ai AFTER INSERT ON source_snapshots BEGIN
+        INSERT INTO source_snapshots_fts(rowid, title, raw_text) VALUES (new.rowid, new.title, new.raw_text);
+    END;
+    """)
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS source_snapshots_ad AFTER DELETE ON source_snapshots BEGIN
+        INSERT INTO source_snapshots_fts(source_snapshots_fts, rowid, title, raw_text) VALUES ('delete', old.rowid, old.title, old.raw_text);
+    END;
+    """)
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS source_snapshots_au AFTER UPDATE ON source_snapshots BEGIN
+        INSERT INTO source_snapshots_fts(source_snapshots_fts, rowid, title, raw_text) VALUES ('delete', old.rowid, old.title, old.raw_text);
+        INSERT INTO source_snapshots_fts(rowid, title, raw_text) VALUES (new.rowid, new.title, new.raw_text);
+    END;
+    """)
+
+    # 4. Triggers for evidence_passages
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS evidence_passages_ai AFTER INSERT ON evidence_passages BEGIN
+        INSERT INTO evidence_passages_fts(rowid, verbatim_excerpt) VALUES (new.rowid, new.verbatim_excerpt);
+    END;
+    """)
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS evidence_passages_ad AFTER DELETE ON evidence_passages BEGIN
+        INSERT INTO evidence_passages_fts(evidence_passages_fts, rowid, verbatim_excerpt) VALUES ('delete', old.rowid, old.verbatim_excerpt);
+    END;
+    """)
+    conn.execute("""
+    CREATE TRIGGER IF NOT EXISTS evidence_passages_au AFTER UPDATE ON evidence_passages BEGIN
+        INSERT INTO evidence_passages_fts(evidence_passages_fts, rowid, verbatim_excerpt) VALUES ('delete', old.rowid, old.verbatim_excerpt);
+        INSERT INTO evidence_passages_fts(rowid, verbatim_excerpt) VALUES (new.rowid, new.verbatim_excerpt);
+    END;
+    """)
+
+    # 5. Idempotent rebuild to ensure any pre-existing rows are indexed
+    conn.execute("INSERT INTO source_snapshots_fts(source_snapshots_fts) VALUES('rebuild');")
+    conn.execute("INSERT INTO evidence_passages_fts(evidence_passages_fts) VALUES('rebuild');")
+    conn.commit()
+
+
+def rebuild_fts_indexes(conn: sqlite3.Connection) -> None:
+    """Force an administrative rebuild of all FTS5 full-text indexes."""
+    conn.execute("INSERT INTO source_snapshots_fts(source_snapshots_fts) VALUES('rebuild');")
+    conn.execute("INSERT INTO evidence_passages_fts(evidence_passages_fts) VALUES('rebuild');")
+    conn.commit()
+
+
+def check_fts_integrity(conn: sqlite3.Connection) -> Dict[str, bool]:
+    """Execute SQLite FTS5 integrity-check commands across virtual tables."""
+    conn.execute("INSERT INTO source_snapshots_fts(source_snapshots_fts) VALUES('integrity-check');")
+    conn.execute("INSERT INTO evidence_passages_fts(evidence_passages_fts) VALUES('integrity-check');")
+    return {
+        "source_snapshots_fts": True,
+        "evidence_passages_fts": True,
+    }
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Execute the authoritative schema script against the provided connection idempotently.
     
@@ -280,6 +386,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _ensure_evidence_origin_columns(conn)
         _ensure_canonical_facts_syndication_columns(conn)
         _ensure_entity_resolution_columns(conn)
+        _ensure_fts_indexes(conn)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize database schema: {exc}") from exc
 
@@ -292,9 +399,10 @@ def verify_schema(conn: sqlite3.Connection) -> Dict[str, Any]:
     """Verify that all 36 domain tables exist and conform to expected structural constraints."""
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")
-    tables = {row["name"] if isinstance(row, sqlite3.Row) else row[0] for row in cursor.fetchall()}
+    all_tables = {row["name"] if isinstance(row, sqlite3.Row) else row[0] for row in cursor.fetchall()}
+    domain_tables = {name for name in all_tables if not is_fts_table(name)}
 
-    missing_tables = sorted(list(EXPECTED_DOMAIN_TABLES - tables))
+    missing_tables = sorted(list(EXPECTED_DOMAIN_TABLES - domain_tables))
     errors: List[str] = []
     if missing_tables:
         errors.append(f"Missing {len(missing_tables)} tables: {missing_tables}")
