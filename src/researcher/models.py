@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
-from typing import Any, List, Optional, Sequence, Set, Tuple
+from typing import Any, List, Optional, Sequence, Set, Tuple, Dict
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.common.provenance import OutputProvenance, ProvenanceOrigin
@@ -261,6 +261,8 @@ class ResearchPackage(BaseModel):
     is_complete: bool = Field(default=False, description="Whether all search and gap iterations finished normally")
     missing_information: Tuple[str, ...] = Field(default=(), description="Identified uncollected information")
     sufficiency_notes: Optional[str] = Field(default=None)
+    question_dag_json: Optional[str] = Field(default=None, description="Serialized EpistemicQuestionDAG snapshot and summary")
+    unresolved_questions: Tuple[str, ...] = Field(default=(), description="Neutral questions that remain uncorroborated, exhausted, or unobservable")
 
 
 @dataclass
@@ -276,6 +278,7 @@ class ResearchAccumulator:
     seen_urls: Set[str] = field(default_factory=set)
     prospect_entity: Optional[EntityRecord] = None
     company_entity: Optional[EntityRecord] = None
+    question_dag: Optional[Any] = None
 
     def add_source(self, source: SourceRecord) -> None:
         """Add a fetched source, maintaining seen URLs."""
@@ -441,6 +444,8 @@ class ResearchAccumulator:
         is_complete: bool = False,
         missing_information: Optional[Sequence[str]] = None,
         sufficiency_notes: Optional[str] = None,
+        question_dag_json: Optional[str] = None,
+        unresolved_questions: Optional[Sequence[str]] = None,
     ) -> ResearchPackage:
         """Freeze mutable accumulator into immutable ResearchPackage contract."""
         return ResearchPackage(
@@ -453,4 +458,6 @@ class ResearchAccumulator:
             is_complete=is_complete,
             missing_information=tuple(missing_information or ()),
             sufficiency_notes=sufficiency_notes,
+            question_dag_json=question_dag_json,
+            unresolved_questions=tuple(unresolved_questions or ()),
         )

@@ -12,6 +12,7 @@ from src.db.state_store import StateStore
 from src.email_generation.generator import EmailGenerationError
 from src.email_generation.models import VerifiedOutreachDraft
 from src.email_generation.service import DraftPersistenceError, EmailGenerationService
+from src.researcher.epistemic_dag import DAGAdapter, GlobalResearchBudget
 from src.researcher.evidence_request.models import EvidenceFeedbackBudget, FeedbackRoundResult
 from src.researcher.evidence_request.executor import EvidenceRequestExecutor
 from src.researcher.models import ResearchAccumulator, ResearchPackage, ResolutionStatus
@@ -71,6 +72,7 @@ class ApplicationOrchestrator:
         run_id: Optional[str] = None,
         max_research_iterations: int = 3,
         allow_insufficient_research: bool = False,
+        total_research_budget: int = 20,
     ) -> RunResult:
         """Execute the full end-to-end outreach pipeline with stage-level persistence."""
         # Ensure database is initialized and schema is valid before executing pipeline
@@ -264,6 +266,8 @@ class ApplicationOrchestrator:
             s_start = datetime.now(timezone.utc).isoformat()
             logger.info("Executing research for run %s (session %s)", active_run_id, session_id)
 
+            global_budget = GlobalResearchBudget(total_budget_units=total_research_budget)
+
             research_package: ResearchPackage = self.researcher.conduct_research(
                 prospect=prospect,
                 outreach=outreach,
@@ -271,6 +275,7 @@ class ApplicationOrchestrator:
                 session_id=session_id,
                 context_id=context_id,
                 max_iterations=max_research_iterations,
+                budget=global_budget,
             )
 
             record_stage(
@@ -282,6 +287,8 @@ class ApplicationOrchestrator:
                     "sources_count": len(research_package.sources),
                     "is_sufficient": research_package.is_sufficient,
                     "is_complete": research_package.is_complete,
+                    "budget_consumed": global_budget.total_units_consumed,
+                    "budget_remaining": global_budget.remaining_total_units,
                 },
             )
 
@@ -463,7 +470,14 @@ class ApplicationOrchestrator:
                         active_run_id,
                         len(evidence_requests),
                     )
-                    feedback_budget = EvidenceFeedbackBudget.create(baseline_budget_units=20)
+                    feedback_budget = EvidenceFeedbackBudget(
+                        baseline_budget_units=global_budget.total_budget_units,
+                        max_feedback_budget_ratio=global_budget.max_feedback_budget_ratio,
+                        feedback_budget_cap=global_budget.feedback_budget_cap,
+                        feedback_units_consumed=global_budget.feedback_units_consumed,
+                        rounds_executed=global_budget.feedback_rounds_executed,
+                        requests_executed_count=global_budget.feedback_requests_executed,
+                    )
                     executor = EvidenceRequestExecutor(researcher=self.researcher, state_store=self.state_store)
 
                     acc = (
@@ -481,18 +495,50 @@ class ApplicationOrchestrator:
                         round_number=1,
                     )
 
+                    delta_feedback = feedback_round_result.budget.feedback_units_consumed - global_budget.feedback_units_consumed
+                    if delta_feedback > 0:
+                        global_budget = global_budget.consume_feedback(
+                            cost_units=delta_feedback,
+                            increment_request=False,
+                        )
+                    global_budget = global_budget.complete_feedback_round()
+
                     # Update research package facts from rehydrated accumulator
                     if hasattr(self.researcher, "_hydrate_accumulator"):
                         updated_acc = self.researcher._hydrate_accumulator(session_id)
                     else:
                         updated_acc = acc
 
-                    research_package = research_package.model_copy(
-                        update={
-                            "facts": list(updated_acc.facts),
-                            "sources": list(updated_acc.sources),
-                        }
-                    )
+                    if research_package.question_dag_json:
+                        try:
+                            summary = json.loads(research_package.question_dag_json)
+                            summary.setdefault("feedback_requests", []).extend([
+                                {"request_id": r.request_id, "predicate": r.requested_predicate, "status": r.status.value}
+                                for r in feedback_round_result.requests
+                            ])
+                            summary["global_budget_consumed"] = global_budget.total_units_consumed
+                            summary["global_budget_remaining"] = global_budget.remaining_total_units
+                            research_package = research_package.model_copy(
+                                update={
+                                    "facts": list(updated_acc.facts),
+                                    "sources": list(updated_acc.sources),
+                                    "question_dag_json": json.dumps(summary),
+                                }
+                            )
+                        except Exception:
+                            research_package = research_package.model_copy(
+                                update={
+                                    "facts": list(updated_acc.facts),
+                                    "sources": list(updated_acc.sources),
+                                }
+                            )
+                    else:
+                        research_package = research_package.model_copy(
+                            update={
+                                "facts": list(updated_acc.facts),
+                                "sources": list(updated_acc.sources),
+                            }
+                        )
 
                     # Re-evaluate strategy with updated research package
                     re_evaluated_strategy = self.strategy_service.develop_strategy(

@@ -30,6 +30,7 @@ from src.researcher.models import (
 )
 from src.researcher.orchestration.evaluator import ResearchSufficiencyEvaluator
 from src.researcher.orchestration.models import (
+    CoverageStatus,
     ResearchSufficiencyAssessment,
     SufficiencyDecision,
 )
@@ -54,6 +55,13 @@ from src.researcher.syndication.normalizer import (
 from src.researcher.syndication.shingling import (
     generate_5gram_shingles,
     tokenize,
+)
+from src.researcher.epistemic_dag import (
+    DAGAdapter,
+    EpistemicDAGScheduler,
+    EpistemicQuestionDAG,
+    GlobalResearchBudget,
+    QuestionLifecycleStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +104,7 @@ class Researcher:
         max_iterations: int = 3,
         max_results_per_query: int = 5,
         max_pages_to_fetch_per_iter: int = 6,
+        budget: Optional[GlobalResearchBudget] = None,
     ) -> ResearchPackage:
         """Execute full multi-turn research lifecycle with sufficiency evaluation and checkpointed recovery."""
         active_session_id = session_id or str(uuid.uuid4())
@@ -124,8 +133,29 @@ class Researcher:
             product=product,
         )
 
+        # Stage 1b: Epistemic Question DAG Initialization & Shared Budget
+        active_budget = budget or GlobalResearchBudget(total_budget_units=20)
+        dag = DAGAdapter.convert_objectives_to_dag(
+            objectives=objectives,
+            run_id=active_session_id,
+            prospect_name=prospect.full_name,
+            company_name=prospect.company_name,
+        )
+
+        try:
+            with self.state_store.uow() as uow:
+                uow.jobs.record_workflow_event(
+                    event_id=str(uuid.uuid4()),
+                    session_id=active_session_id,
+                    event_type="epistemic_dag_initialized",
+                    payload=json.dumps(EpistemicDAGScheduler.serialize_dag_summary(dag)),
+                )
+        except Exception as we_err:
+            logger.debug("Could not record workflow event: %s", we_err)
+
         # Initialize accumulator with any previously saved state
         accumulator = self._hydrate_accumulator(active_session_id)
+        accumulator.question_dag = dag
 
         # Determine starting iteration (checkpoint recovery)
         current_iter_num, latest_assessment = self._determine_resumption_point(
@@ -166,17 +196,54 @@ class Researcher:
             logger.info("Executing research turn %d of %d (Session: %s)", current_iter_num, max_iterations, active_session_id)
 
             try:
-                # Step A: Query Generation
+                # Step A: DAG-Driven Question Selection & Query Generation
+                selected_nodes, dag = EpistemicDAGScheduler.select_next_batch(
+                    dag=dag,
+                    budget=active_budget,
+                    max_batch_size=3,
+                )
+                accumulator.question_dag = dag
+
                 queries: List[GeneratedQuery] = []
-                if current_iter_num == 1:
-                    for obj in objectives:
-                        q_list = self.query_generator.generate_queries(
-                            objective=obj,
-                            prospect=prospect,
-                            existing_queries=accumulator.search_queries_used,
+                queries_by_node: Dict[str, List[GeneratedQuery]] = {}
+
+                if selected_nodes:
+                    for node in selected_nodes:
+                        node_queries: List[GeneratedQuery] = []
+                        matching_obj = next(
+                            (obj for obj in objectives if f"qn_{obj.objective_id.replace('-', '')[:10]}" == node.question_id),
+                            None,
                         )
-                        queries.extend(q_list)
-                else:
+                        if matching_obj and current_iter_num == 1:
+                            node_queries = self.query_generator.generate_queries(
+                                objective=matching_obj,
+                                prospect=prospect,
+                                existing_queries=accumulator.search_queries_used,
+                            )
+                        elif matching_obj and current_iter_num > 1 and latest_assessment:
+                            node_queries = self.followup_generator.generate_followup_queries(
+                                prospect=prospect,
+                                assessment=latest_assessment,
+                                existing_queries=accumulator.search_queries_used,
+                                max_queries=2,
+                            )
+
+                        if not node_queries:
+                            all_dirs = node.supporting_search_directions + node.disconfirming_search_directions
+                            for dir_text in all_dirs:
+                                if dir_text and dir_text not in accumulator.search_queries_used:
+                                    node_queries.append(
+                                        GeneratedQuery(
+                                            query_id=str(uuid.uuid4()),
+                                            objective_id=matching_obj.objective_id if matching_obj else None,
+                                            query_text=dir_text,
+                                            target_entity=matching_obj.target_entity if matching_obj else TargetEntity.COMPANY,
+                                            rationale=f"Search direction for question {node.question_id}",
+                                        )
+                                    )
+                        queries_by_node[node.question_id] = node_queries
+                        queries.extend(node_queries)
+                elif current_iter_num > 1:
                     if latest_assessment:
                         queries = self.followup_generator.generate_followup_queries(
                             prospect=prospect,
@@ -184,6 +251,10 @@ class Researcher:
                             existing_queries=accumulator.search_queries_used,
                             max_queries=4,
                         )
+                    if not queries:
+                        logger.info("DAG Scheduler: 0 questions ready and no follow-up queries in turn %d; halting iterations.", current_iter_num)
+                        is_complete = True
+                        break
 
                 # Persist queries
                 valid_obj_ids = {obj.objective_id for obj in objectives}
@@ -208,6 +279,7 @@ class Researcher:
                     accumulator=accumulator,
                     max_results=max_results_per_query,
                     max_pages=max_pages_to_fetch_per_iter,
+                    budget=active_budget,
                 )
 
                 # Step C: Entity Resolution
@@ -227,6 +299,35 @@ class Researcher:
                         accumulator=accumulator,
                     )
                     new_facts_count += len(extracted)
+
+                # Step D2: Epistemic DAG Outcome Recording
+                new_facts = accumulator.facts[-new_facts_count:] if new_facts_count > 0 else []
+                new_sources = accumulator.sources[-len(new_snapshot_ids):] if new_snapshot_ids else []
+                had_fail = getattr(self, "_last_search_had_failure", False)
+
+                for node in selected_nodes:
+                    node_queries = queries_by_node.get(node.question_id, [])
+                    q_texts = [q.query_text for q in node_queries]
+                    dag = EpistemicDAGScheduler.record_node_outcome(
+                        dag=dag,
+                        question_id=node.question_id,
+                        facts_found=new_facts,
+                        sources_found=new_sources,
+                        executed_queries=q_texts,
+                        had_provider_failure=had_fail,
+                    )
+                accumulator.question_dag = dag
+
+                try:
+                    with self.state_store.uow() as uow:
+                        uow.jobs.record_workflow_event(
+                            event_id=str(uuid.uuid4()),
+                            session_id=active_session_id,
+                            event_type="epistemic_dag_updated",
+                            payload=json.dumps(EpistemicDAGScheduler.serialize_dag_summary(dag)),
+                        )
+                except Exception as we_err:
+                    logger.debug("Could not record workflow event: %s", we_err)
 
                 # Step E: Research Sufficiency Evaluation
                 with self.state_store.uow() as uow:
@@ -286,6 +387,39 @@ class Researcher:
                     latest_assessment = assessment
                     current_iter_num += 1
 
+                    # Reopen DAG nodes for objectives that require continued research
+                    for obj_ass in assessment.objective_assessments:
+                        if obj_ass.coverage_status != CoverageStatus.ADEQUATE:
+                            n_id = f"qn_{obj_ass.objective_id.replace('-', '')[:10]}"
+                            if n_id in dag.nodes:
+                                node = dag.get_node(n_id)
+                                if node.status in (
+                                    QuestionLifecycleStatus.RESOLVED,
+                                    QuestionLifecycleStatus.IN_PROGRESS,
+                                    QuestionLifecycleStatus.PARTIALLY_RESOLVED,
+                                ):
+                                    dag = dag.reopen_node(
+                                        question_id=n_id,
+                                        reason=f"Sufficiency continuation ({obj_ass.coverage_status.value}): {'; '.join(obj_ass.missing_aspects or [])}",
+                                        provenance=f"assessment:{assessment.assessment_id}",
+                                    )
+                    for rec_act in assessment.recommended_actions:
+                        if rec_act.target_objective_id:
+                            n_id = f"qn_{rec_act.target_objective_id.replace('-', '')[:10]}"
+                            if n_id in dag.nodes:
+                                node = dag.get_node(n_id)
+                                if node.status in (
+                                    QuestionLifecycleStatus.RESOLVED,
+                                    QuestionLifecycleStatus.IN_PROGRESS,
+                                    QuestionLifecycleStatus.PARTIALLY_RESOLVED,
+                                ):
+                                    dag = dag.reopen_node(
+                                        question_id=n_id,
+                                        reason=f"Sufficiency recommended action {rec_act.action_type.value}: {rec_act.gap_description}",
+                                        provenance=f"assessment:{assessment.assessment_id}",
+                                    )
+                    accumulator.question_dag = dag
+
             except Exception as exc:
                 logger.error("Error executing iteration %s: %s", iteration_id, exc, exc_info=True)
                 with self.state_store.uow() as uow:
@@ -300,11 +434,21 @@ class Researcher:
         remaining_gaps = list(final_assessment.remaining_gaps) if final_assessment else []
         explanation = final_assessment.explanation if final_assessment else "Research completed"
 
+        dag_summary = EpistemicDAGScheduler.serialize_dag_summary(dag)
+        dag_json = json.dumps(dag_summary)
+        unresolved_q_texts = [
+            n["neutral_question"]
+            for n in dag_summary.get("nodes", [])
+            if n["status"] in ("unresolved", "exhausted", "partially_resolved", "unobservable", "blocked")
+        ]
+
         package = accumulator.to_package(
             is_sufficient=is_sufficient,
             is_complete=is_complete,
             missing_information=remaining_gaps,
             sufficiency_notes=explanation,
+            question_dag_json=dag_json,
+            unresolved_questions=unresolved_q_texts,
         )
 
         # Update Session
@@ -496,13 +640,24 @@ class Researcher:
         accumulator: ResearchAccumulator,
         max_results: int,
         max_pages: int,
+        budget: Optional[GlobalResearchBudget] = None,
     ) -> List[str]:
         raw_occurrences: List[Dict[str, Any]] = []
+        self._last_search_had_failure = False
 
         for q in queries:
+            if budget and not budget.can_consume_baseline(1):
+                logger.info("Search query '%s' skipped due to global budget exhaustion", q.query_text)
+                continue
+            if budget:
+                budget = budget.consume_baseline(1)
+
             start_t = time.time()
             resp: SearchResponse = self.search_client.search(query=q.query_text, max_results=max_results)
             duration_ms = (time.time() - start_t) * 1000
+
+            if resp.status == SearchStatus.FAILED:
+                self._last_search_had_failure = True
 
             execution_id = str(uuid.uuid4())
             provider = getattr(self.search_client, "provider", None)
