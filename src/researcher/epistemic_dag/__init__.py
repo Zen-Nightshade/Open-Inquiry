@@ -16,7 +16,7 @@ from .models import (
 )
 from .observability import ObservabilityClassifier
 from .scheduler import EpistemicDAGScheduler
-from .stopping import StoppingDecision, StoppingEvaluator
+from .stopping import StoppingDecision, StoppingEvaluator, fact_matches_predicate, is_fact_attributable_to_node
 from .voi import ValueOfInformationEvaluator
 
 __all__ = [
@@ -37,4 +37,6 @@ __all__ = [
     "ValueOfInformationEvaluator",
     "VoIAction",
     "VoIAssessment",
+    "fact_matches_predicate",
+    "is_fact_attributable_to_node",
 ]

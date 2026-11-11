@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.config.settings import GROQ_LARGE
 from src.generator.decoding import DecodeConfig
 from src.generator.engine.engine import GeneratorEngine
@@ -137,7 +138,7 @@ class ResearchSufficiencyEvaluator:
         """Run LLM semantic evaluation followed by strict deterministic policy enforcement."""
 
         # 1. Run LLM semantic evaluation
-        raw_evaluation = self._run_llm_evaluation(
+        raw_evaluation, execution_id, model_name, is_fallback = self._run_llm_evaluation(
             objectives=objectives,
             facts=facts,
             sources=sources,
@@ -327,6 +328,16 @@ class ResearchSufficiencyEvaluator:
             ),
         )
 
+        prov = OutputProvenance(
+            origin=ProvenanceOrigin.MODEL if not is_fallback else ProvenanceOrigin.HEURISTIC_FALLBACK,
+            component="research_sufficiency_evaluator",
+            model_name=model_name if not is_fallback else None,
+            provider=self.provider_name if not is_fallback else None,
+            model_execution_id=execution_id,
+            rule_id="evaluator_llm_fallback" if is_fallback else "deterministic_policy_enforcement",
+            is_fallback=is_fallback,
+        )
+
         return ResearchSufficiencyAssessment(
             session_id=session_id,
             iteration_id=iteration_id,
@@ -339,6 +350,7 @@ class ResearchSufficiencyEvaluator:
             remaining_gaps=tuple(dict.fromkeys(all_remaining_gaps)),
             recommended_actions=tuple(recommended_actions),
             explanation=raw_evaluation.explanation,
+            provenance=prov,
         )
 
     def _evaluate_deterministic_policy(
@@ -498,7 +510,7 @@ class ResearchSufficiencyEvaluator:
         conflicts: Sequence[Dict[str, Any]],
         iteration_number: int,
         max_iterations: int,
-    ) -> RawSufficiencyEvaluation:
+    ) -> tuple[RawSufficiencyEvaluation, Optional[str], Optional[str], bool]:
         user_content = self._build_prompt_content(
             objectives=objectives,
             facts=facts,
@@ -533,21 +545,34 @@ class ResearchSufficiencyEvaluator:
             logger.warning(
                 "LLM evaluation failed or unparsed: %s. Falling back to default raw evaluation.", exc
             )
-            return RawSufficiencyEvaluation(
-                explanation=f"LLM evaluation failed or unparsed: {exc}",
-                identity_resolution_viable=True,
+            return (
+                RawSufficiencyEvaluation(
+                    explanation=f"LLM evaluation failed or unparsed: {exc}",
+                    identity_resolution_viable=True,
+                ),
+                None,
+                None,
+                True,
             )
+
+        exec_id = response.metadata.get("execution_id") if hasattr(response, "metadata") and response.metadata else None
+        model_name = getattr(response, "model_name", None)
 
         if not response.parsed_output or not isinstance(response.parsed_output, RawSufficiencyEvaluation):
             logger.warning(
                 "LLM failed to return structured RawSufficiencyEvaluation. Falling back to default raw evaluation."
             )
-            return RawSufficiencyEvaluation(
-                explanation=f"LLM evaluation failed or unparsed: {response.text[:100]}",
-                identity_resolution_viable=True,
+            return (
+                RawSufficiencyEvaluation(
+                    explanation=f"LLM evaluation failed or unparsed: {response.text[:100]}",
+                    identity_resolution_viable=True,
+                ),
+                exec_id,
+                model_name,
+                True,
             )
 
-        return response.parsed_output
+        return response.parsed_output, exec_id, model_name, False
 
     def _build_prompt_content(
         self,

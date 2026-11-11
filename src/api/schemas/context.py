@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.context.models import (
+    CapabilityNode as DomainCapabilityNode,
+    ConstraintType as DomainConstraintType,
     OutreachContext as DomainOutreachContext,
+    ProductConstraint as DomainProductConstraint,
+    ProductContract as DomainProductContract,
     ProductContext as DomainProductContext,
     ProspectContext as DomainProspectContext,
 )
@@ -29,6 +34,88 @@ class ProspectInput(BaseModel):
         )
 
 
+class CapabilityInput(BaseModel):
+    name: str = Field(..., min_length=1, description="Capability name")
+    description: Optional[str] = Field(None, description="Detailed capability description")
+    target_operational_problems: List[str] = Field(default_factory=list, description="Target operational problems")
+    target_buyer_personas: List[str] = Field(default_factory=list, description="Target buyer personas")
+    supported_use_cases: List[str] = Field(default_factory=list, description="Supported use cases")
+    scope: List[str] = Field(default_factory=list, description="Supported scope or platforms")
+    required_prerequisites: List[str] = Field(default_factory=list, description="Required prerequisites")
+    hard_exclusions: List[str] = Field(default_factory=list, description="Explicit hard exclusions")
+    verified_proof_points: List[str] = Field(default_factory=list, description="Proof points or metrics")
+
+    def to_domain(self) -> DomainCapabilityNode:
+        return DomainCapabilityNode(
+            name=self.name,
+            description=self.description,
+            target_operational_problems=self.target_operational_problems,
+            target_buyer_personas=self.target_buyer_personas,
+            supported_use_cases=self.supported_use_cases,
+            scope=self.scope,
+            required_prerequisites=self.required_prerequisites,
+            hard_exclusions=self.hard_exclusions,
+            verified_proof_points=self.verified_proof_points,
+            provenance=OutputProvenance(
+                origin=ProvenanceOrigin.MANUAL_INPUT,
+                component="api_input",
+            ),
+        )
+
+
+class ConstraintInput(BaseModel):
+    name: str = Field(..., min_length=1, description="Constraint name or label")
+    constraint_type: str = Field(default="scope_limitation", description="prerequisite, hard_exclusion, or scope_limitation")
+    description: Optional[str] = Field(None, description="Detailed explanation")
+    applies_to_capabilities: List[str] = Field(default_factory=list, description="Specific capability names")
+    details: List[str] = Field(default_factory=list, description="Specific boundary terms")
+
+    def to_domain(self) -> DomainProductConstraint:
+        try:
+            c_type = DomainConstraintType(self.constraint_type.lower())
+        except ValueError:
+            c_type = DomainConstraintType.SCOPE_LIMITATION
+
+        return DomainProductConstraint(
+            name=self.name,
+            constraint_type=c_type,
+            description=self.description,
+            applies_to_capabilities=self.applies_to_capabilities,
+            details=self.details,
+            provenance=OutputProvenance(
+                origin=ProvenanceOrigin.MANUAL_INPUT,
+                component="api_input",
+            ),
+        )
+
+
+class ProductContractInput(BaseModel):
+    product_name: Optional[str] = Field(None, description="Product name (defaults to outer product_name if omitted)")
+    contract_version: str = Field(default="1.0.0", description="Contract revision or schema version")
+    description: Optional[str] = Field(None, description="Description (defaults to outer description if omitted)")
+    value_proposition: Optional[str] = Field(None, description="Value proposition (defaults to outer if omitted)")
+    capabilities: List[CapabilityInput] = Field(default_factory=list, description="Structured capabilities")
+    global_constraints: List[ConstraintInput] = Field(default_factory=list, description="Global constraints")
+    hard_exclusions: List[str] = Field(default_factory=list, description="Global hard exclusions")
+    is_exhaustive: bool = Field(default=False, description="Whether declarations are exhaustive")
+
+    def to_domain(self, fallback_name: str, fallback_desc: str, fallback_vp: str) -> DomainProductContract:
+        return DomainProductContract(
+            product_name=self.product_name or fallback_name,
+            contract_version=self.contract_version,
+            description=self.description or fallback_desc,
+            value_proposition=self.value_proposition or fallback_vp,
+            capabilities=[c.to_domain() for c in self.capabilities],
+            global_constraints=[gc.to_domain() for gc in self.global_constraints],
+            hard_exclusions=self.hard_exclusions,
+            is_exhaustive=self.is_exhaustive,
+            provenance=OutputProvenance(
+                origin=ProvenanceOrigin.MANUAL_INPUT,
+                component="api_input",
+            ),
+        )
+
+
 class ProductInput(BaseModel):
     product_name: str = Field(..., min_length=1, description="Product or offering name")
     description: str = Field(..., min_length=1, description="Product description")
@@ -37,16 +124,61 @@ class ProductInput(BaseModel):
     icp: Optional[str] = Field(None, description="Ideal customer profile summary")
     differentiators: List[str] = Field(default_factory=list, description="Unique differentiators")
     limitations: List[str] = Field(default_factory=list, description="Explicit boundaries and product limitations")
+    contract: Optional[ProductContractInput] = Field(None, description="Optional structured product contract")
+    structured_capabilities: List[CapabilityInput] = Field(default_factory=list, description="Optional structured capabilities")
 
     def to_domain(self) -> DomainProductContext:
+        domain_contract: Optional[DomainProductContract] = None
+
+        if self.contract:
+            domain_contract = self.contract.to_domain(
+                fallback_name=self.product_name,
+                fallback_desc=self.description,
+                fallback_vp=self.value_proposition,
+            )
+        elif self.structured_capabilities:
+            cap_nodes = [sc.to_domain() for sc in self.structured_capabilities]
+            constraints = [
+                DomainProductConstraint(
+                    name=lim.strip(),
+                    constraint_type=DomainConstraintType.SCOPE_LIMITATION,
+                    description=lim.strip(),
+                    provenance=OutputProvenance(
+                        origin=ProvenanceOrigin.MANUAL_INPUT,
+                        component="api_input",
+                    ),
+                )
+                for lim in self.limitations
+                if lim.strip()
+            ]
+            domain_contract = DomainProductContract(
+                product_name=self.product_name,
+                contract_version="1.0.0",
+                description=self.description,
+                value_proposition=self.value_proposition,
+                capabilities=cap_nodes,
+                global_constraints=constraints,
+                hard_exclusions=[lim.strip() for lim in self.limitations if lim.strip()],
+                is_exhaustive=False,
+                provenance=OutputProvenance(
+                    origin=ProvenanceOrigin.MANUAL_INPUT,
+                    component="api_input",
+                ),
+            )
+
+        caps = list(self.capabilities)
+        if domain_contract and not caps:
+            caps = [c.name for c in domain_contract.capabilities]
+
         return DomainProductContext(
             product_name=self.product_name,
             description=self.description,
-            capabilities=self.capabilities,
+            capabilities=caps,
             value_proposition=self.value_proposition,
             icp=self.icp,
             differentiators=self.differentiators,
             limitations=self.limitations,
+            contract=domain_contract,
         )
 
 

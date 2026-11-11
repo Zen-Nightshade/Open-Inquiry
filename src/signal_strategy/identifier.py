@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.config.settings import GROQ_LARGE
 from src.context.models import ProductContext, ProspectContext
 from src.generator.decoding import DecodeConfig
@@ -107,16 +108,24 @@ class SignalIdentifier:
         try:
             response = self.engine.generate(request)
             raw_output = response.parsed_output
+            exec_id = response.metadata.get("execution_id") if hasattr(response, "metadata") and response.metadata else None
+            model_name = getattr(response, "model_name", None)
             if isinstance(raw_output, RawSignalIdentificationOutput):
-                validated_signals = self._validate_and_ground_signals(raw_output.candidate_signals, facts_by_id)
+                validated_signals = self._validate_and_ground_signals(
+                    raw_output.candidate_signals,
+                    facts_by_id,
+                    model_execution_id=exec_id,
+                    model_name=model_name,
+                )
                 if validated_signals:
                     return validated_signals
-                logger.warning("LLM produced candidate signals but none passed grounding validation.")
+                logger.warning("LLM produced candidate signals but none passed grounding validation. Returning 0 signals.")
+                return []
         except Exception as e:
-            logger.warning(f"Error during LLM signal identification: {e}. Executing deterministic fallback.")
+            logger.warning(f"Error during LLM signal identification: {e}. Returning 0 signals.")
+            return []
 
-        # Deterministic fallback: synthesize signals directly from high-confidence facts
-        return self._deterministic_fallback_signals(facts, product)
+        return []
 
     def _build_user_prompt(
         self,
@@ -162,6 +171,8 @@ class SignalIdentifier:
         self,
         raw_signals: List[RawCandidateSignal],
         facts_by_id: Dict[str, CanonicalFact],
+        model_execution_id: Optional[str] = None,
+        model_name: Optional[str] = None,
     ) -> List[CandidateSignal]:
         """Validate fact citations, discard hallucinated fact IDs, and construct grounded CandidateSignals."""
         grounded_signals: List[CandidateSignal] = []
@@ -198,6 +209,14 @@ class SignalIdentifier:
 
             latest_event_date = max(event_dates) if event_dates else None
 
+            prov = OutputProvenance(
+                origin=ProvenanceOrigin.MODEL,
+                component="signal_identifier",
+                model_name=model_name,
+                provider=self.provider_name,
+                model_execution_id=model_execution_id,
+            )
+
             signal = CandidateSignal(
                 label=raw.label.strip(),
                 description=raw.description.strip(),
@@ -209,35 +228,8 @@ class SignalIdentifier:
                 commercial_opportunity=raw.commercial_opportunity.strip() if raw.commercial_opportunity else None,
                 event_date=latest_event_date,
                 is_inferred=raw.is_inferred,
+                provenance=prov,
             )
             grounded_signals.append(signal)
 
         return grounded_signals
-
-    def _deterministic_fallback_signals(
-        self,
-        facts: Sequence[CanonicalFact],
-        product: ProductContext,
-    ) -> List[CandidateSignal]:
-        """Synthesize candidate signals deterministically directly from canonical facts."""
-        signals: List[CandidateSignal] = []
-
-        for fact in facts:
-            cat_display = fact.fact_category.value.replace("_", " ").title()
-            label = f"{cat_display}: {fact.claim_text[:40].strip()}"
-            signals.append(
-                CandidateSignal(
-                    label=label,
-                    description=fact.claim_text,
-                    supporting_fact_ids=[fact.fact_id],
-                    fact_category=fact.fact_category,
-                    associated_entity_ids=list(fact.entity_ids),
-                    observed_event=fact.claim_text,
-                    business_implication=f"Operational priorities in {cat_display}",
-                    commercial_opportunity=f"Alignment with {product.product_name}",
-                    event_date=fact.primary_event_date,
-                    is_inferred=False,
-                )
-            )
-
-        return signals

@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS outreach_drafts (
     claim_verifications   TEXT NOT NULL,
     quality_evaluation    TEXT NOT NULL,
     human_review_status   TEXT NOT NULL DEFAULT 'pending_review'
-        CHECK (human_review_status IN ('pending_review', 'approved', 'rejected', 'needs_revision')),
+        CHECK (human_review_status IN ('pending_review', 'approved', 'rejected', 'needs_revision', 'quarantined_verification_failed')),
     reviewer_notes        TEXT,
     current_revision      INTEGER NOT NULL DEFAULT 1,
     created_at            TEXT NOT NULL,

@@ -99,38 +99,81 @@ class JobRepository:
     def record_model_execution(
         self,
         execution_id: str,
-        job_id: Optional[str],
         provider: str,
         model_name: str,
         task_type: str,
         prompt_hash: str,
+        job_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        stage_name: Optional[str] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
         duration_ms: Optional[float] = None,
+        status: str = "completed",
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+        attempt_num: int = 1,
         executed_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = executed_at or datetime.now(timezone.utc).isoformat()
-        sql = """
-        INSERT INTO model_executions (
-            execution_id, job_id, provider, model_name, task_type,
-            prompt_hash, input_tokens, output_tokens, duration_ms, executed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """
-        self.conn.execute(
-            sql,
-            (
-                execution_id,
-                job_id,
-                provider,
-                model_name,
-                task_type,
-                prompt_hash,
-                input_tokens,
-                output_tokens,
-                duration_ms,
-                now,
-            ),
-        )
+
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(model_executions);")
+        cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+
+        if job_id:
+            job_row = cursor.execute("SELECT 1 FROM jobs WHERE job_id = ? LIMIT 1;", (job_id,)).fetchone()
+            if not job_row:
+                job_id = None
+
+        col_names = [
+            "execution_id",
+            "job_id",
+            "provider",
+            "model_name",
+            "task_type",
+            "prompt_hash",
+            "input_tokens",
+            "output_tokens",
+            "duration_ms",
+            "executed_at",
+        ]
+        values = [
+            execution_id,
+            job_id,
+            provider,
+            model_name,
+            task_type,
+            prompt_hash,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            now,
+        ]
+
+        if "run_id" in cols:
+            col_names.append("run_id")
+            values.append(run_id)
+        if "stage_name" in cols:
+            col_names.append("stage_name")
+            values.append(stage_name)
+        if "status" in cols:
+            col_names.append("status")
+            values.append(status)
+        if "error_type" in cols:
+            col_names.append("error_type")
+            values.append(error_type)
+        if "error_message" in cols:
+            col_names.append("error_message")
+            values.append(error_message)
+        if "attempt_num" in cols:
+            col_names.append("attempt_num")
+            values.append(attempt_num)
+
+        placeholders = ", ".join(["?"] * len(col_names))
+        sql = f"INSERT INTO model_executions ({', '.join(col_names)}) VALUES ({placeholders});"
+        self.conn.execute(sql, values)
+
         cursor = self.conn.execute(
             "SELECT * FROM model_executions WHERE execution_id = ?;",
             (execution_id,),
@@ -138,16 +181,30 @@ class JobRepository:
         row = cursor.fetchone()
         return dict(row) if row else {}
 
-    def get_model_executions(self, job_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        if job_id:
-            cursor = self.conn.execute(
+    insert_model_execution = record_model_execution
+
+    def get_model_executions(
+        self,
+        job_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(model_executions);")
+        cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+
+        if run_id and "run_id" in cols:
+            cursor.execute(
+                "SELECT * FROM model_executions WHERE run_id = ? ORDER BY executed_at ASC;",
+                (run_id,),
+            )
+        elif job_id:
+            cursor.execute(
                 "SELECT * FROM model_executions WHERE job_id = ? ORDER BY executed_at ASC;",
                 (job_id,),
             )
         else:
-            cursor = self.conn.execute(
-                "SELECT * FROM model_executions ORDER BY executed_at ASC;"
-            )
+            cursor.execute("SELECT * FROM model_executions ORDER BY executed_at ASC;")
+
         return [dict(r) for r in cursor.fetchall()]
 
     def record_workflow_event(

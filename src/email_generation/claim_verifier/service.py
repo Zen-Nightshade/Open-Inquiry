@@ -116,6 +116,7 @@ class ClaimVerifierService:
                 claims=all_claims,
                 contract=contract,
                 toulmin_argument=toulmin,
+                research_package=research_package,
             )
             capability_results.extend(cap_res)
             all_findings.extend(cap_findings)

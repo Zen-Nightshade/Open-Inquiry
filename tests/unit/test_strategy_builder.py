@@ -259,3 +259,39 @@ def test_strategy_builder_deterministic_fallback(strategy_fixtures):
     assert result.strategy.primary_signal.signal.signal_id == "sig-fallback"
     assert len(result.strategy.alignment.capability_mapping) >= 1
     assert result.strategy.alignment.capability_mapping[0] in product.capabilities
+
+
+def test_strategy_builder_unviable_when_product_alignment_is_unevaluated(strategy_fixtures):
+    """When top signal has unevaluated product_alignment (None), strategy must be marked unviable."""
+    prospect, product, outreach = strategy_fixtures
+
+    sig = CandidateSignal(
+        signal_id="sig-uneval",
+        label="Event with Unevaluated Alignment",
+        description="Event description",
+        supporting_fact_ids=["fact-1"],
+    )
+    score = SignalScore(
+        evidence_strength=0.90,
+        recency_score=0.90,
+        prospect_relevance=0.85,
+        product_alignment=None,  # Unevaluated due to LLM failure
+        business_significance=0.80,
+        composite_score=0.20,
+    )
+    ranked = RankedSignal(signal=sig, score=score, rationale="Alignment was unevaluated")
+
+    builder = StrategyBuilder(engine=MockEngine(None))
+    result = builder.build_strategy(
+        ranked_signals=[ranked],
+        prospect=prospect,
+        product=product,
+        outreach=outreach,
+    )
+
+    assert result.is_viable is False
+    assert result.strategy is None
+    assert "product alignment is unevaluated" in (result.rejection_reason or "")
+    assert len(result.unviable_reasons) >= 1
+    assert "product alignment is unevaluated" in result.unviable_reasons[0]
+

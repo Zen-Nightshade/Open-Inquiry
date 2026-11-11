@@ -47,7 +47,7 @@ def _make_dummy_prospect() -> ProspectContext:
 
 def _make_dummy_product() -> ProductContext:
     return ProductContext(
-        product_name="Zamp Engine",
+        product_name="Open Inquiry Engine",
         description="Autonomous outreach research engine.",
         capabilities=["Real-time company intelligence", "Verifiable fact extraction"],
         value_proposition="Automate personalized, evidence-grounded research outreach.",
@@ -57,9 +57,9 @@ def _make_dummy_product() -> ProductContext:
 def _make_dummy_outreach() -> OutreachContext:
     return OutreachContext(
         objective="Schedule introductory briefing",
-        sender_identity="Alex Rivers, Lead Architect at Zamp AI",
+        sender_identity="Alex Rivers, Lead Architect at SystemsLab",
         sender_name="Alex Rivers",
-        sender_company="Zamp AI",
+        sender_company="SystemsLab",
     )
 
 
@@ -390,7 +390,7 @@ def test_app_orchestrator_recovery_and_retrieval_after_restart():
         assert snapshot.run_id == run_id
         assert snapshot.status == RunStatus.COMPLETED
         assert snapshot.prospect.full_name == "Elena Rostova"
-        assert snapshot.product.product_name == "Zamp Engine"
+        assert snapshot.product.product_name == "Open Inquiry Engine"
         assert snapshot.strategy_result is not None
         assert "Congratulation" in snapshot.strategy_result.strategy.messaging_approach
 
@@ -439,3 +439,43 @@ def test_app_orchestrator_failure_handling():
         snapshot = orchestrator.get_run(res.run_id)
         assert snapshot.status == RunStatus.FAILED
         assert "timeout" in snapshot.error_message
+
+
+def test_app_orchestrator_collision_resistant_identifiers():
+    """Verify session_id and job_id use full collision-resistant hex UUIDs, not 8-char prefixes."""
+    with tempfile.NamedTemporaryFile() as tf:
+        store = StateStore(tf.name)
+        store.initialize()
+
+        package = _make_dummy_package(is_sufficient=True)
+        researcher = MockResearcher(package)
+        strat_service = MockStrategyService(_make_dummy_strategy_result(True))
+
+        orchestrator = ApplicationOrchestrator(
+            state_store=store,
+            researcher=researcher,
+            strategy_service=strat_service,
+        )
+
+        res = orchestrator.run(
+            prospect=_make_dummy_prospect(),
+            product=_make_dummy_product(),
+            outreach=_make_dummy_outreach(),
+        )
+
+        assert res.research_session_id is not None
+        assert res.research_session_id.startswith("session_")
+        session_hex = res.research_session_id.replace("session_", "")
+        assert len(session_hex) == 32  # Full collision-resistant 128-bit hex UUID
+        # Must be valid hex
+        int(session_hex, 16)
+
+        # Inspect snapshot and job record in db
+        snapshot = orchestrator.get_run(res.run_id)
+        assert snapshot is not None
+        assert snapshot.job_id is not None
+        assert snapshot.job_id.startswith("job_")
+        job_hex = snapshot.job_id.replace("job_", "")
+        assert len(job_hex) == 32
+        int(job_hex, 16)
+

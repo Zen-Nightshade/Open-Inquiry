@@ -5,16 +5,24 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.config.settings import GROQ_LARGE
-from src.context.models import ProductContext, ProspectContext
+from src.context.models import CompatibilityStatus, ProductContext, ProspectContext
 from src.generator.decoding import DecodeConfig
 from src.generator.engine.engine import GeneratorEngine
 from src.generator.engine.request import GenerationRequest
 from src.generator.prompting.message import Message, Role
 from src.generator.prompting.prompt import Prompt
 from src.generator.structured_output.pydantic_parser import PydanticParser
-from src.researcher.models import CanonicalFact, ConfidenceLevel, FactCategory
-from .models import CandidateSignal, RankedSignal, SignalScore
+from src.researcher.models import CanonicalFact, ConfidenceLevel, FactCategory, ResearchPackage
+from .eligibility import SignalEligibilityEvaluator
+from .models import (
+    CandidateSignal,
+    EligibilityStatus,
+    RankedSignal,
+    SignalEligibility,
+    SignalScore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +34,7 @@ class RawEvaluatedSignal(BaseModel):
 
     signal_id: str
     prospect_relevance: float = Field(ge=0.0, le=1.0, description="Relevance to the prospect's role and decision-making scope")
-    product_alignment: float = Field(ge=0.0, le=1.0, description="Direct fit with product capabilities")
+    product_alignment: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Direct fit with product capabilities")
     business_significance: float = Field(ge=0.0, le=1.0, description="Scale and commercial impact of the event for target company")
     rationale: str = Field(description="Explanation of commercial relevance, product fit, and scoring")
 
@@ -67,10 +75,12 @@ class SignalRanker:
         self,
         engine: Optional[GeneratorEngine] = None,
         provider_name: Optional[str] = None,
+        eligibility_evaluator: Optional[SignalEligibilityEvaluator] = None,
     ) -> None:
         self.provider_name = provider_name or GROQ_LARGE
         self.engine = engine or GeneratorEngine(default_provider=self.provider_name)
         self.parser = PydanticParser(RawSignalEvaluationOutput)
+        self.eligibility_evaluator = eligibility_evaluator or SignalEligibilityEvaluator()
 
     def rank_signals(
         self,
@@ -78,8 +88,9 @@ class SignalRanker:
         facts: Sequence[CanonicalFact],
         prospect: ProspectContext,
         product: ProductContext,
+        research_package: Optional[ResearchPackage] = None,
     ) -> List[RankedSignal]:
-        """Score all candidate signals and return them sorted in descending order of composite score."""
+        """Score all candidate signals separating non-compensatory eligibility from comparative ranking."""
         if not signals:
             return []
 
@@ -92,22 +103,80 @@ class SignalRanker:
             recency = self._calculate_recency_score(sig)
             deterministic_scores[sig.signal_id] = (ev_strength, recency)
 
-        # Step 2: Use LLM for semantic evaluation (prospect relevance, product alignment, business significance)
-        llm_evaluations = self._evaluate_signals_with_llm(signals, prospect, product)
+        # Step 2: Use LLM for semantic evaluation proposal (prospect relevance, product alignment, business significance)
+        llm_evaluations: Dict[str, RawEvaluatedSignal] = {}
+        exec_id: Optional[str] = None
+        model_name: Optional[str] = None
 
-        # Step 3: Combine scores and compute composite score with gating
-        ranked_signals: List[RankedSignal] = []
+        if signals:
+            llm_evaluations, exec_id, model_name = self._evaluate_signals_with_llm(
+                signals, prospect, product
+            )
+
+        # Step 3: Evaluate non-compensatory eligibility gates for every signal using LLM proposals
+        eligibility_by_id: Dict[str, SignalEligibility] = {}
         for sig in signals:
+            eval_data = llm_evaluations.get(sig.signal_id)
+            eligibility_by_id[sig.signal_id] = self.eligibility_evaluator.evaluate(
+                signal=sig,
+                facts_by_id=facts_by_id,
+                prospect=prospect,
+                product=product,
+                research_package=research_package,
+                proposal_alignment=eval_data.product_alignment if eval_data else None,
+                proposal_rationale=eval_data.rationale if eval_data else None,
+            )
+
+        verified_signals = [s for s in signals if eligibility_by_id[s.signal_id].is_verified_eligible]
+        conditional_signals = [s for s in signals if eligibility_by_id[s.signal_id].requires_diagnostic_strategy]
+        ineligible_signals = [s for s in signals if eligibility_by_id[s.signal_id].is_ineligible]
+
+        # Step 4: Rank verified-compatible candidates
+        verified_ranked: List[RankedSignal] = []
+        for sig in verified_signals:
             ev_strength, recency = deterministic_scores[sig.signal_id]
             eval_data = llm_evaluations.get(sig.signal_id)
+            elig = eligibility_by_id[sig.signal_id]
+
+            has_contract_verified_cap = (
+                elig.matched_capability_name is not None
+                and elig.compatibility_result is not None
+                and elig.compatibility_result.status == CompatibilityStatus.VERIFIED_COMPATIBLE
+                and elig.product_gate.passed
+                and not elig.product_gate.details.get("is_unevaluated", False)
+            )
 
             if eval_data:
                 p_rel = eval_data.prospect_relevance
-                p_align = eval_data.product_alignment
                 b_sig = eval_data.business_significance
                 rationale = eval_data.rationale
+                if eval_data.product_alignment is not None:
+                    p_align = eval_data.product_alignment
+                elif has_contract_verified_cap:
+                    p_align = 1.0
+                else:
+                    p_align = None
+
+                prov = OutputProvenance(
+                    origin=ProvenanceOrigin.MODEL,
+                    component="signal_ranker",
+                    model_name=model_name,
+                    provider=self.provider_name,
+                    model_execution_id=exec_id,
+                )
             else:
-                p_rel, p_align, b_sig, rationale = self._heuristic_fallback_scores(sig, prospect, product)
+                p_rel, p_align_fb, b_sig, rationale = self._heuristic_fallback_scores(sig, prospect, product)
+                if has_contract_verified_cap:
+                    p_align = 1.0
+                else:
+                    p_align = p_align_fb
+
+                prov = OutputProvenance(
+                    origin=ProvenanceOrigin.HEURISTIC_FALLBACK,
+                    component="signal_ranker",
+                    rule_id="heuristic_fallback_scores",
+                    is_fallback=True,
+                )
 
             composite = self._calculate_composite_score(
                 evidence_strength=ev_strength,
@@ -121,22 +190,127 @@ class SignalRanker:
                 evidence_strength=round(ev_strength, 2),
                 recency_score=round(recency, 2),
                 prospect_relevance=round(p_rel, 2),
-                product_alignment=round(p_align, 2),
+                product_alignment=round(p_align, 2) if p_align is not None else None,
                 business_significance=round(b_sig, 2),
                 composite_score=round(composite, 2),
+                provenance=prov,
             )
 
-            ranked_signals.append(
+            verified_ranked.append(
                 RankedSignal(
                     signal=sig,
                     score=score,
                     rationale=rationale,
+                    eligibility=elig,
+                    provenance=prov,
                 )
             )
 
-        # Sort descending by composite score
-        ranked_signals.sort(key=lambda s: s.score.composite_score, reverse=True)
-        return ranked_signals
+        verified_ranked.sort(key=lambda s: s.score.composite_score, reverse=True)
+
+        # Step 5: Rank conditional candidates separately (epistemic/commercial score, product_alignment=None)
+        conditional_ranked: List[RankedSignal] = []
+        for sig in conditional_signals:
+            ev_strength, recency = deterministic_scores[sig.signal_id]
+            eval_data = llm_evaluations.get(sig.signal_id)
+            elig = eligibility_by_id[sig.signal_id]
+
+            if eval_data:
+                p_rel = eval_data.prospect_relevance
+                b_sig = eval_data.business_significance
+                rationale = eval_data.rationale
+                prov = OutputProvenance(
+                    origin=ProvenanceOrigin.MODEL,
+                    component="signal_ranker",
+                    model_name=model_name,
+                    provider=self.provider_name,
+                    model_execution_id=exec_id,
+                )
+            else:
+                p_rel, _, b_sig, rationale = self._heuristic_fallback_scores(sig, prospect, product)
+                prov = OutputProvenance(
+                    origin=ProvenanceOrigin.HEURISTIC_FALLBACK,
+                    component="signal_ranker",
+                    rule_id="heuristic_fallback_scores",
+                    is_fallback=True,
+                )
+
+            cond_score = self._calculate_conditional_score(
+                evidence_strength=ev_strength,
+                recency_score=recency,
+                prospect_relevance=p_rel,
+                business_significance=b_sig,
+            )
+
+            score = SignalScore(
+                evidence_strength=round(ev_strength, 2),
+                recency_score=round(recency, 2),
+                prospect_relevance=round(p_rel, 2),
+                product_alignment=None,  # Preserved as None; no numerical approximation
+                business_significance=round(b_sig, 2),
+                composite_score=round(cond_score, 2),
+                provenance=prov,
+            )
+
+            conditional_ranked.append(
+                RankedSignal(
+                    signal=sig,
+                    score=score,
+                    rationale=rationale,
+                    eligibility=elig,
+                    provenance=prov,
+                )
+            )
+
+        conditional_ranked.sort(key=lambda s: s.score.composite_score, reverse=True)
+
+        # Step 6: Construct RankedSignals for ineligible signals (not in either pool)
+        ineligible_ranked: List[RankedSignal] = []
+        for sig in ineligible_signals:
+            ev_strength, recency = deterministic_scores[sig.signal_id]
+            eval_data = llm_evaluations.get(sig.signal_id)
+            elig = eligibility_by_id[sig.signal_id]
+
+            prov = OutputProvenance(
+                origin=ProvenanceOrigin.DETERMINISTIC_RULE,
+                component="signal_ranker",
+                rule_id="non_compensatory_ineligibility_veto",
+            )
+
+            p_align = (
+                0.0
+                if (eval_data and eval_data.product_alignment == 0.0)
+                or (elig.product_gate and not elig.product_gate.passed and elig.compatibility_result and elig.compatibility_result.status == CompatibilityStatus.INCOMPATIBLE)
+                else (eval_data.product_alignment if eval_data else None)
+            )
+
+            score = SignalScore(
+                evidence_strength=round(ev_strength, 2),
+                recency_score=round(recency, 2),
+                prospect_relevance=0.0,
+                product_alignment=p_align,
+                business_significance=0.0,
+                composite_score=0.0,
+                provenance=prov,
+            )
+
+            reasons_str = "; ".join(elig.rejection_reasons) if elig.rejection_reasons else "Failed eligibility gate"
+            rationale = eval_data.rationale if (eval_data and eval_data.product_alignment == 0.0) else f"Ineligible for outreach: {reasons_str}."
+
+            ineligible_ranked.append(
+                RankedSignal(
+                    signal=sig,
+                    score=score,
+                    rationale=rationale,
+                    eligibility=elig,
+                    provenance=prov,
+                )
+            )
+
+        ineligible_ranked.sort(key=lambda s: (s.score.recency_score, s.score.evidence_strength), reverse=True)
+
+        # Invariant: verified-compatible candidates ALWAYS precede conditional candidates
+        return verified_ranked + conditional_ranked + ineligible_ranked
 
     def _calculate_evidence_strength(
         self,
@@ -196,34 +370,63 @@ class SignalRanker:
         evidence_strength: float,
         recency_score: float,
         prospect_relevance: float,
-        product_alignment: float,
+        product_alignment: Optional[float],
         business_significance: float,
     ) -> float:
         """
-        Calculate weighted composite score with commercial gating.
+        Calculate weighted composite score with commercial gating for verified-compatible signals.
         
-        Gating Rule: If product_alignment < 0.25, the signal cannot qualify as a viable
-        lead hook for outreach regardless of how high other dimensions score.
+        Gating Rules:
+        - If product_alignment is None (unevaluated): The signal cannot qualify as a viable
+          lead hook for outreach regardless of other scores. Composite score is capped at 0.20
+          so that other dimensions cannot compensate for missing product relevance.
+        - If product_alignment < 0.25 (evaluated low/unviable): Gated to min(raw_composite, product_alignment).
         """
+        effective_alignment = product_alignment if product_alignment is not None else 0.0
+
         raw_composite = (
-            product_alignment * 0.35
+            effective_alignment * 0.35
             + prospect_relevance * 0.25
             + business_significance * 0.15
             + evidence_strength * 0.15
             + recency_score * 0.10
         )
 
+        if product_alignment is None:
+            return min(raw_composite, 0.20)
+
         if product_alignment < 0.25:
             return min(raw_composite, product_alignment)
 
         return min(1.0, max(0.0, raw_composite))
+
+    def _calculate_conditional_score(
+        self,
+        evidence_strength: float,
+        recency_score: float,
+        prospect_relevance: float,
+        business_significance: float,
+    ) -> float:
+        """
+        Score conditional candidates within their separate diagnostic pool.
+        
+        Evaluates purely the epistemic and commercial dimensions without fabricating a product alignment number.
+        Weights normalized across the 4 non-alignment dimensions (0.25 + 0.15 + 0.15 + 0.10 = 0.65).
+        """
+        raw_score = (
+            prospect_relevance * 0.25
+            + business_significance * 0.15
+            + evidence_strength * 0.15
+            + recency_score * 0.10
+        ) / 0.65
+        return min(1.0, max(0.0, raw_score))
 
     def _evaluate_signals_with_llm(
         self,
         signals: Sequence[CandidateSignal],
         prospect: ProspectContext,
         product: ProductContext,
-    ) -> Dict[str, RawEvaluatedSignal]:
+    ) -> tuple[Dict[str, RawEvaluatedSignal], Optional[str], Optional[str]]:
         """Invoke LLM to semantically score prospect relevance, product alignment, and business significance."""
         prompt = Prompt()
         prompt.add_message(Message(role=Role.SYSTEM, content=SIGNAL_RANKER_SYSTEM_PROMPT))
@@ -240,6 +443,8 @@ class SignalRanker:
         try:
             response = self.engine.generate(request)
             raw = response.parsed_output
+            exec_id = response.metadata.get("execution_id") if hasattr(response, "metadata") and response.metadata else None
+            model_name = getattr(response, "model_name", None)
             if isinstance(raw, RawSignalEvaluationOutput):
                 eval_by_id = {ev.signal_id: ev for ev in raw.evaluations if ev.signal_id}
                 # Support positional fallback if signal_id is missing or empty
@@ -247,11 +452,11 @@ class SignalRanker:
                     for idx, sig in enumerate(signals):
                         if sig.signal_id not in eval_by_id:
                             eval_by_id[sig.signal_id] = raw.evaluations[idx]
-                return eval_by_id
+                return eval_by_id, exec_id, model_name
         except Exception as e:
             logger.warning(f"Error during LLM signal ranking: {e}. Using heuristic scoring.")
 
-        return {}
+        return {}, None, None
 
     def _build_ranking_prompt(
         self,
@@ -295,8 +500,12 @@ class SignalRanker:
         signal: CandidateSignal,
         prospect: ProspectContext,
         product: ProductContext,
-    ) -> tuple[float, float, float, str]:
-        """Heuristic fallback scoring when LLM is unavailable."""
+    ) -> tuple[float, Optional[float], float, str]:
+        """Heuristic fallback scoring when LLM is unavailable.
+        
+        Product alignment is preserved as None (unevaluated) rather than fabricating
+        an arbitrary fallback score.
+        """
         title_lower = (prospect.designation or "").lower()
         signal_text = f"{signal.label} {signal.description}".lower()
 
@@ -308,14 +517,9 @@ class SignalRanker:
             p_rel += 0.2
         p_rel = min(1.0, p_rel)
 
-        # Product alignment heuristic
-        p_align = 0.4
-        cap_words = " ".join(product.capabilities).lower().split()
-        matches = sum(1 for w in cap_words if len(w) > 4 and w in signal_text)
-        if matches >= 2:
-            p_align = 0.8
-        elif matches == 1:
-            p_align = 0.6
+        # Product alignment is unevaluated when model scoring is unavailable.
+        # Do not fabricate a 0.40 fallback or assume relevance without model evaluation.
+        p_align: Optional[float] = None
 
         # Business significance heuristic
         b_sig = 0.5
@@ -324,5 +528,8 @@ class SignalRanker:
         elif signal.fact_category in (FactCategory.ACHIEVEMENT, FactCategory.HIRING):
             b_sig = 0.65
 
-        rationale = f"Heuristically scored based on {signal.fact_category.value} alignment with {product.product_name}."
+        rationale = (
+            f"Heuristically scored for prospect relevance and {signal.fact_category.value} business significance; "
+            f"product alignment is unevaluated because LLM scoring was unavailable."
+        )
         return p_rel, p_align, b_sig, rationale

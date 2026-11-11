@@ -61,7 +61,7 @@ def test_cli_run_with_input_file(monkeypatch):
                 "company_domain": "vanguardai.io",
             },
             "product": {
-                "product_name": "Zamp Intelligence",
+                "product_name": "Open Inquiry Suite",
                 "description": "Automated research engine",
                 "capabilities": ["Fact extraction", "Signal detection"],
                 "value_proposition": "Turn research into verified opportunities",
@@ -70,7 +70,7 @@ def test_cli_run_with_input_file(monkeypatch):
                 "objective": "Introductory briefing",
                 "sender_identity": "Alex Rivers, Architect",
                 "sender_name": "Alex Rivers",
-                "sender_company": "Zamp AI",
+                "sender_company": "Open Inquiry AI",
             },
         }
         input_path.write_text(json.dumps(input_data), encoding="utf-8")
@@ -147,7 +147,143 @@ def test_cli_run_missing_inputs_non_interactive():
         "--non-interactive",
     ])
     assert res.exit_code != 0
-    assert "Error: Missing required prospect" in res.output
+    assert "Error: Missing required prospect context" in res.output
+
+
+def test_cli_run_missing_product_non_interactive():
+    # Prospect supplied, but zero product context provided
+    res = runner.invoke(app, [
+        "run",
+        "-n", "Elena Rostova",
+        "-c", "Vanguard AI",
+        "--non-interactive",
+    ])
+    assert res.exit_code != 0
+    assert "Error: Missing required product context" in res.output
+    assert "product_name" in res.output
+    assert "description" in res.output
+    assert "value_proposition" in res.output
+    assert "capabilities" in res.output
+
+
+def test_cli_run_incomplete_product_non_interactive():
+    # Only product_name provided, missing description, value_prop, and capabilities
+    res = runner.invoke(app, [
+        "run",
+        "-n", "Elena Rostova",
+        "-c", "Vanguard AI",
+        "-p", "KubePulse",
+        "--non-interactive",
+    ])
+    assert res.exit_code != 0
+    assert "Error: Missing required product context" in res.output
+    assert "product_name" not in res.output  # product_name was supplied
+    assert "description (--product-desc)" in res.output
+    assert "value_proposition (--value-prop)" in res.output
+    assert "capabilities (--capabilities)" in res.output
+
+
+def test_cli_run_blank_product_fields_rejected():
+    # Blank whitespace product fields must be rejected as missing
+    res = runner.invoke(app, [
+        "run",
+        "-n", "Elena Rostova",
+        "-c", "Vanguard AI",
+        "-p", "   ",
+        "--product-desc", "   ",
+        "--value-prop", "Valid VP",
+        "--capabilities", "Cap1",
+        "--non-interactive",
+    ])
+    assert res.exit_code != 0
+    assert "Error: Missing required product context" in res.output
+    assert "product_name (--product / -p)" in res.output
+    assert "description (--product-desc)" in res.output
+    assert "value_proposition" not in res.output  # Valid VP was supplied
+
+
+def test_cli_run_invalid_product_creates_no_database_records():
+    with tempfile.TemporaryDirectory() as td:
+        db_path = str(Path(td) / "clean.db")
+        store = StateStore(db_path=db_path)
+        store.initialize()
+
+        res = runner.invoke(app, [
+            "run",
+            "-n", "Elena Rostova",
+            "-c", "Vanguard AI",
+            "--db-path", db_path,
+            "--non-interactive",
+        ])
+        assert res.exit_code != 0
+
+        # Verify absolutely zero runs, prospects, or product versions were created
+        with store.uow() as uow:
+            assert len(uow.runs.list_runs()) == 0
+            cur = uow.conn.execute("SELECT count(*) FROM prospects;")
+            assert cur.fetchone()[0] == 0
+            cur = uow.conn.execute("SELECT count(*) FROM product_versions;")
+            assert cur.fetchone()[0] == 0
+
+
+def test_cli_run_interactive_product_prompts():
+    inputs = "\n".join([
+        "KubePulse",  # product name
+        "Autonomous Kubernetes telemetry profiler",  # description
+        "Cut cluster cloud spend by 40%",  # value proposition
+        "eBPF tracing, Automated right-sizing",  # capabilities
+    ]) + "\n"
+
+    dummy_result = MagicMock()
+    dummy_result.status = RunStatus.COMPLETED
+    dummy_result.strategy_result = None
+    dummy_result.stage_records = []
+    dummy_result.run_id = "run-interactive-test"
+
+    with patch.object(ApplicationOrchestrator, "run", return_value=dummy_result) as mock_run:
+        res = runner.invoke(
+            app,
+            ["run", "-n", "Elena Rostova", "-c", "Vanguard AI"],
+            input=inputs,
+        )
+        assert res.exit_code == 0
+        assert mock_run.called
+        call_kwargs = mock_run.call_args[1]
+        prod: ProductContext = call_kwargs["product"]
+        assert prod.product_name == "KubePulse"
+        assert prod.description == "Autonomous Kubernetes telemetry profiler"
+        assert prod.value_proposition == "Cut cluster cloud spend by 40%"
+        assert prod.capabilities == ["eBPF tracing", "Automated right-sizing"]
+
+
+def test_cli_run_valid_explicit_product_options():
+    dummy_result = MagicMock()
+    dummy_result.status = RunStatus.COMPLETED
+    dummy_result.strategy_result = None
+    dummy_result.stage_records = []
+    dummy_result.run_id = "run-explicit-test"
+
+    with patch.object(ApplicationOrchestrator, "run", return_value=dummy_result) as mock_run:
+        res = runner.invoke(
+            app,
+            [
+                "run",
+                "-n", "Elena Rostova",
+                "-c", "Vanguard AI",
+                "-p", "KubePulse",
+                "--product-desc", "Telemetry profiler",
+                "--value-prop", "Cut cloud spend",
+                "--capabilities", "eBPF, Profiling",
+                "--non-interactive",
+            ],
+        )
+        assert res.exit_code == 0
+        assert mock_run.called
+        prod: ProductContext = mock_run.call_args[1]["product"]
+        assert prod.product_name == "KubePulse"
+        assert prod.description == "Telemetry profiler"
+        assert prod.value_proposition == "Cut cloud spend"
+        assert prod.capabilities == ["eBPF", "Profiling"]
 
 
 def test_cli_run_list_and_inspect():
@@ -207,7 +343,7 @@ def test_cli_run_list_and_inspect():
             prospect_id=pid,
             prospect_snapshot_json=prospect.model_dump_json(),
             product_snapshot_json=ProductContext(
-                product_name="Zamp",
+                product_name="Open Inquiry",
                 description="Engine",
                 capabilities=["Fact extraction"],
                 value_proposition="VP",
@@ -295,12 +431,16 @@ def test_cli_serve_invokes_uvicorn():
     with patch("uvicorn.run") as mock_uvicorn:
         res = runner.invoke(app, ["serve", "--host", "127.0.0.1", "--port", "8008"])
         assert res.exit_code == 0
-        assert "Starting Zamp API Server" in res.output
-        mock_uvicorn.assert_called_once_with(
-            "src.api.app:create_app",
-            host="127.0.0.1",
-            port=8008,
-            reload=False,
-            factory=True,
-        )
+        assert "Starting Open Inquiry API Server" in res.output
+        assert mock_uvicorn.called
+        call_kwargs = mock_uvicorn.call_args[1]
+        assert call_kwargs["host"] == "127.0.0.1"
+        assert call_kwargs["port"] == 8008
+
+
+def test_cli_app_name_and_help():
+    res = runner.invoke(app, ["--help"])
+    assert res.exit_code == 0
+    assert "Open Inquiry: Autonomous Evidence-Grounded Research & Outreach Engine" in res.output
+
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Set, Tuple
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.context.models import CapabilityNode, CompatibilityStatus, ProductContract
 from src.email_generation.claim_verifier.models import (
     CapabilityCheckResult,
@@ -11,6 +12,7 @@ from src.email_generation.claim_verifier.models import (
     VerificationFinding,
     VerifierFindingSeverity,
 )
+from src.researcher.models import ResearchPackage
 from src.signal_strategy.models import ToulminArgument
 
 
@@ -26,6 +28,7 @@ class ProductCapabilityBoundsGate:
         claims: List[DecomposedClaim],
         contract: ProductContract,
         toulmin_argument: Optional[ToulminArgument] = None,
+        research_package: Optional[ResearchPackage] = None,
     ) -> Tuple[List[CapabilityCheckResult], List[VerificationFinding]]:
         """Verify product-facing claims against ProductContract capabilities and proof points."""
         results: List[CapabilityCheckResult] = []
@@ -56,8 +59,7 @@ class ProductCapabilityBoundsGate:
 
         product_claims = [
             c for c in claims
-            if (c.is_product_claim or c.category == ClaimCategory.PRODUCT_CAPABILITY)
-            and c.category in (ClaimCategory.PRODUCT_CAPABILITY, ClaimCategory.METRIC_IMPACT)
+            if (c.is_product_claim or c.category in (ClaimCategory.PRODUCT_CAPABILITY, ClaimCategory.METRIC_IMPACT))
             and c.is_material
         ]
 
@@ -102,6 +104,11 @@ class ProductCapabilityBoundsGate:
                     metric_clean in pp
                     for pp in all_whitelisted_proofs
                 )
+                if not is_metric_whitelisted and research_package and research_package.facts:
+                    is_metric_whitelisted = any(
+                        metric_clean in f.claim_text.lower()
+                        for f in research_package.facts
+                    )
                 if not is_metric_whitelisted:
                     unsupported_metrics.append(metric)
 
@@ -128,6 +135,19 @@ class ProductCapabilityBoundsGate:
                         section=claim.section,
                         text_span=(claim.span_start, claim.span_end),
                         details={"unsupported_metrics": unsupported_metrics},
+                    )
+                )
+                continue
+
+            # Non-product metric claims that passed numerical verification do not require capability matching
+            if not (claim.is_product_claim or claim.category == ClaimCategory.PRODUCT_CAPABILITY):
+                results.append(
+                    CapabilityCheckResult(
+                        claim_id=claim.claim_id,
+                        is_whitelisted=True,
+                        is_precondition_satisfied=True,
+                        violates_exclusion=False,
+                        rationale="Metric claim verified against grounded factual evidence or whitelisted proof points.",
                     )
                 )
                 continue

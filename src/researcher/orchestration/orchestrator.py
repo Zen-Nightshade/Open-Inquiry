@@ -62,6 +62,7 @@ from src.researcher.epistemic_dag import (
     EpistemicQuestionDAG,
     GlobalResearchBudget,
     QuestionLifecycleStatus,
+    is_fact_attributable_to_node,
 )
 from src.researcher.retrieval import HistoricalRetrievalService, RetrievalScope, RetrievedRecordType
 
@@ -350,10 +351,14 @@ class Researcher:
                 for node in selected_nodes:
                     node_queries = queries_by_node.get(node.question_id, [])
                     q_texts = [q.query_text for q in node_queries]
+                    node_facts = [
+                        f for f in new_facts
+                        if is_fact_attributable_to_node(f, node, q_texts)
+                    ]
                     dag = EpistemicDAGScheduler.record_node_outcome(
                         dag=dag,
                         question_id=node.question_id,
-                        facts_found=new_facts,
+                        facts_found=node_facts,
                         sources_found=new_sources,
                         executed_queries=q_texts,
                         had_provider_failure=had_fail,

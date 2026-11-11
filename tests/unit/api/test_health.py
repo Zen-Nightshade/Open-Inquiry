@@ -39,3 +39,15 @@ def test_health_initialized_database():
         assert data["database"]["is_initialized"] is True
         assert data["database"]["is_schema_valid"] is True
         assert data["version"] == "1.0.0"
+
+
+def test_api_metadata_branding():
+    app = create_app()
+    assert app.title == "Open Inquiry Research & Outreach Strategy API"
+    assert "Open Inquiry" in app.description
+    client = TestClient(app)
+    res = client.get("/openapi.json")
+    assert res.status_code == 200
+    openapi = res.json()
+    assert openapi["info"]["title"] == "Open Inquiry Research & Outreach Strategy API"
+

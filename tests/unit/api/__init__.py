@@ -1,1 +1,1 @@
-# Tests for Zamp HTTP API Layer
+# Tests for Open Inquiry HTTP API Layer

@@ -24,6 +24,7 @@ class HumanReviewStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     NEEDS_REVISION = "needs_revision"
+    QUARANTINED_VERIFICATION_FAILED = "quarantined_verification_failed"
 
 
 class LinterSeverity(str, Enum):

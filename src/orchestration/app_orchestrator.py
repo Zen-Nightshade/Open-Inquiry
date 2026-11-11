@@ -332,14 +332,30 @@ class ApplicationOrchestrator:
 
             # Rule B: Unresolved or ambiguous identity is fatal unless allow_insufficient_research is requested
             had_sufficiency_warning = False
-            if research_package.prospect_entity and research_package.prospect_entity.resolution_status in (
-                ResolutionStatus.UNRESOLVED,
-                ResolutionStatus.AMBIGUOUS,
-            ):
-                reason = (
-                    f"Prospect identity resolution failed with status: "
-                    f"{research_package.prospect_entity.resolution_status.value}."
+            prospect_unresolved = bool(
+                research_package.prospect_entity and research_package.prospect_entity.resolution_status in (
+                    ResolutionStatus.UNRESOLVED,
+                    ResolutionStatus.AMBIGUOUS,
                 )
+            )
+            company_unresolved = bool(
+                research_package.company_entity and research_package.company_entity.resolution_status in (
+                    ResolutionStatus.UNRESOLVED,
+                    ResolutionStatus.AMBIGUOUS,
+                )
+            )
+
+            if prospect_unresolved or company_unresolved:
+                unresolved_reasons = []
+                if company_unresolved:
+                    unresolved_reasons.append(
+                        f"Company identity resolution failed with status: {research_package.company_entity.resolution_status.value}."
+                    )
+                if prospect_unresolved:
+                    unresolved_reasons.append(
+                        f"Prospect identity resolution failed with status: {research_package.prospect_entity.resolution_status.value}."
+                    )
+                reason = " ".join(unresolved_reasons)
                 warnings.append(reason)
                 if not allow_insufficient_research:
                     record_stage(
@@ -644,12 +660,17 @@ class ApplicationOrchestrator:
                     has_unverified_claims = bool(getattr(draft, "verifier_result", None) and getattr(draft.verifier_result, "unverified_claim_ids", []))
                     verifier_passed = bool(getattr(draft.verifier_result, "passed", False)) if getattr(draft, "verifier_result", None) else True
 
-                    if has_verifier_errors:
-                        warnings.append(f"Draft verification produced {email_details['verifier_errors_count']} error finding(s). Requires human review.")
-                    if has_unverified_claims:
-                        warnings.append(f"Draft contains {len(email_details['unverified_claim_ids'])} unverified claim(s). Requires human review.")
-
-                    if had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings) or has_verifier_warnings or has_verifier_errors or has_unverified_claims or not verifier_passed:
+                    if has_verifier_errors or not verifier_passed:
+                        err_count = email_details['verifier_errors_count']
+                        email_stage_status = StageStatus.FAILED
+                        email_stage_err = f"Draft verification failed with {err_count} error finding(s). Draft quarantined."
+                        final_status = RunStatus.FAILED
+                        warnings.append(email_stage_err)
+                    elif had_sufficiency_warning or (draft.linter_result and draft.linter_result.has_warnings) or has_verifier_warnings or has_unverified_claims:
+                        if has_unverified_claims:
+                            warnings.append(f"Draft contains {len(email_details['unverified_claim_ids'])} unverified claim(s). Requires human review.")
+                        if has_verifier_warnings:
+                            warnings.append("Draft verification produced warnings requiring human review.")
                         final_status = RunStatus.COMPLETED_WITH_WARNINGS
                     else:
                         final_status = RunStatus.COMPLETED

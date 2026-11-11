@@ -206,6 +206,11 @@ class EntityResolutionService:
                     "disambiguation_notes": prob_company.rationale,
                 }
             )
+            if status == ResolutionStatus.RESOLVED:
+                status = ResolutionStatus.AMBIGUOUS
+                conf = ConfidenceLevel.LOW
+            if prob_company.rationale not in conflicts:
+                conflicts.append(prob_company.rationale)
         elif prob_company.outcome == ResolutionOutcome.UNRESOLVED:
             c_entity = c_entity.model_copy(
                 update={
@@ -214,6 +219,11 @@ class EntityResolutionService:
                     "disambiguation_notes": prob_company.rationale,
                 }
             )
+            if status == ResolutionStatus.RESOLVED:
+                status = ResolutionStatus.UNRESOLVED
+                conf = ConfidenceLevel.UNRESOLVED
+            if prob_company.rationale not in conflicts:
+                conflicts.append(prob_company.rationale)
         elif prob_company.outcome == ResolutionOutcome.MATCH and prob_company.selected_candidate:
             cand = prob_company.selected_candidate
             c_entity = c_entity.model_copy(

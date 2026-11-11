@@ -295,3 +295,115 @@ def test_signal_ranker_deterministic_recency_score(ranking_context):
     assert scores["s2"] == 0.70
     assert scores["s3"] == 0.30
     assert scores["s4"] == 0.45
+
+
+def test_signal_ranker_model_failure_leaves_alignment_unevaluated(ranking_context):
+    """When the LLM fails, product_alignment must remain None (unevaluated) and composite score is capped."""
+    prospect, product = ranking_context
+
+    fact = CanonicalFact(
+        fact_id="f1",
+        claim_text="Nexus Health deployed new cloud patient portal",
+        evidence_records=[EvidenceRecord(source_id="s1", verbatim_excerpt="Nexus deployed portal")],
+        primary_event_date=datetime.date.today(),
+        composite_confidence=ConfidenceLevel.HIGH,
+    )
+    sig = CandidateSignal(
+        signal_id="sig-portal",
+        label="Patient Portal Deployment",
+        description="Nexus deployed portal",
+        supporting_fact_ids=["f1"],
+        event_date=fact.primary_event_date,
+    )
+
+    class FailingEngine(GeneratorEngine):
+        def __init__(self):
+            super().__init__(default_provider="mock")
+
+        def generate(self, request: GenerationRequest) -> GenerationResponse:
+            raise RuntimeError("Groq rate limit or connection error")
+
+    ranker = SignalRanker(engine=FailingEngine())
+    ranked = ranker.rank_signals(signals=[sig], facts=[fact], prospect=prospect, product=product)
+
+    assert len(ranked) == 1
+    top = ranked[0]
+    # Product alignment must be None, NOT an arbitrary 0.40 fallback
+    assert top.score.product_alignment is None
+    # Composite score must be gated/capped at <= 0.20
+    assert top.score.composite_score <= 0.20
+    assert "product alignment is unevaluated" in top.rationale
+
+
+def test_signal_ranker_missing_alignment_output(ranking_context):
+    """When LLM returns an evaluation with missing product_alignment, it is preserved as None."""
+    prospect, product = ranking_context
+
+    fact = CanonicalFact(
+        fact_id="f1",
+        claim_text="Nexus Health expanded operations",
+        evidence_records=[EvidenceRecord(source_id="s1", verbatim_excerpt="Expansion")],
+        primary_event_date=datetime.date.today(),
+    )
+    sig = CandidateSignal(
+        signal_id="sig-exp",
+        label="Nexus Expansion",
+        description="Expansion",
+        supporting_fact_ids=["f1"],
+    )
+
+    raw_eval = RawSignalEvaluationOutput(
+        evaluations=[
+            RawEvaluatedSignal(
+                signal_id="sig-exp",
+                prospect_relevance=0.85,
+                product_alignment=None,  # Missing from LLM
+                business_significance=0.80,
+                rationale="Relevance evaluated but alignment omitted",
+            )
+        ]
+    )
+
+    ranker = SignalRanker(engine=MockEngine(raw_eval))
+    ranked = ranker.rank_signals(signals=[sig], facts=[fact], prospect=prospect, product=product)
+
+    assert len(ranked) == 1
+    assert ranked[0].score.product_alignment is None
+    assert ranked[0].score.composite_score <= 0.20
+
+
+def test_signal_ranker_explicit_incompatible_capability_preserved(ranking_context):
+    """An explicit evaluation of zero relevance (0.0) is distinguished from unevaluated (None)."""
+    prospect, product = ranking_context
+
+    fact = CanonicalFact(
+        fact_id="f1",
+        claim_text="Nexus Health purchased catering supplies",
+        evidence_records=[EvidenceRecord(source_id="s1", verbatim_excerpt="Catering")],
+    )
+    sig = CandidateSignal(
+        signal_id="sig-cater",
+        label="Catering",
+        description="Catering",
+        supporting_fact_ids=["f1"],
+    )
+
+    raw_eval = RawSignalEvaluationOutput(
+        evaluations=[
+            RawEvaluatedSignal(
+                signal_id="sig-cater",
+                prospect_relevance=0.70,
+                product_alignment=0.0,  # Explicitly incompatible
+                business_significance=0.60,
+                rationale="Zero relevance to FHIR EHR synchronization",
+            )
+        ]
+    )
+
+    ranker = SignalRanker(engine=MockEngine(raw_eval))
+    ranked = ranker.rank_signals(signals=[sig], facts=[fact], prospect=prospect, product=product)
+
+    assert len(ranked) == 1
+    assert ranked[0].score.product_alignment == 0.0
+    assert ranked[0].score.product_alignment is not None
+    assert ranked[0].score.composite_score == 0.0

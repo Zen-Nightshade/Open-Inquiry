@@ -775,6 +775,8 @@ def review_list(
             st_styled = "[green]approved[/green]"
         elif st == "rejected":
             st_styled = "[red]rejected[/red]"
+        elif st == "quarantined_verification_failed":
+            st_styled = "[bold red]quarantined[/bold red]"
         else:
             st_styled = "[yellow]pending_review[/yellow]"
 

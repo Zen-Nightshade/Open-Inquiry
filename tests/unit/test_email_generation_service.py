@@ -423,7 +423,7 @@ def test_service_rewrite_failure_preserves_original_draft():
     assert generator.call_count == 2
     assert draft.generation_attempts in (1, 2)
     assert draft.linter_result.has_errors is True
-    assert draft.human_review_status == HumanReviewStatus.PENDING_REVIEW
+    assert draft.human_review_status == HumanReviewStatus.QUARANTINED_VERIFICATION_FAILED
 
 
 def test_service_persistence_failure_raises_draft_persistence_error():
@@ -788,8 +788,8 @@ def test_service_verifier_error_after_rewrite_preserves_draft_for_human_review()
     # Generator called twice (max 1 rewrite)
     assert generator.call_count == 2
     assert draft.generation_attempts == 2
-    # Draft is still preserved in PENDING_REVIEW (fail-safe for human review)
-    assert draft.human_review_status == HumanReviewStatus.PENDING_REVIEW
+    # Draft is quarantined due to verification failure (circuit breaker protects review queue)
+    assert draft.human_review_status == HumanReviewStatus.QUARANTINED_VERIFICATION_FAILED
     assert any("HARD_EXCLUSION_VIOLATION" in reason for reason in draft.human_review_reasons)
     assert draft.verifier_result.has_errors is True
 

@@ -5,6 +5,8 @@ from enum import Enum
 from typing import Optional, Tuple
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.common.provenance import OutputProvenance
+
 
 class SufficiencyDimension(str, Enum):
     """The four epistemic dimensions of research sufficiency."""
@@ -142,6 +144,7 @@ class ResearchSufficiencyAssessment(BaseModel):
     remaining_gaps: Tuple[str, ...] = ()
     recommended_actions: Tuple[RecommendedAction, ...] = ()
     explanation: str
+    provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and producing component metadata")
 
     @property
     def is_sufficient(self) -> bool:

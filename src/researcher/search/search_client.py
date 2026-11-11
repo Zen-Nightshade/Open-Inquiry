@@ -26,8 +26,19 @@ class SearchClient:
         self.max_results_per_domain = max_results_per_domain
 
     def search(self, query: str, max_results: int = 10) -> SearchResponse:
-        """Execute a single query through the configured search provider."""
-        return self.provider.search(query=query, max_results=max_results)
+        """Execute a single query through the configured search provider with defensive exception catching."""
+        try:
+            return self.provider.search(query=query, max_results=max_results)
+        except Exception as exc:
+            logger.error("Unhandled exception from search provider for query '%s': %s", query, exc)
+            return SearchResponse(
+                query=query,
+                status=SearchStatus.FAILED,
+                results=[],
+                error_message=f"ProviderException ({type(exc).__name__}): {exc}",
+                is_transient=False,
+                attempts=1,
+            )
 
     def deduplicate(
         self,

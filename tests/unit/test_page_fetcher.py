@@ -64,7 +64,7 @@ def test_fetch_success_with_missing_publication_date():
     <head><title>Product Documentation Overview</title></head>
     <body>
         <article>
-            <p>Zamp automates personalized B2B outreach research, claim verification, and drafting.</p>
+            <p>Open Inquiry automates personalized B2B outreach research, claim verification, and drafting.</p>
             <p>Built with reliable provenance tracking and evidence corroboration safeguards.</p>
         </article>
     </body>
@@ -76,14 +76,14 @@ def test_fetch_success_with_missing_publication_date():
     mock_client = create_mock_client(handler)
     fetcher = PageFetcher(client=mock_client)
 
-    outcome = fetcher.fetch("https://docs.zamp.ai/overview")
+    outcome = fetcher.fetch("https://docs.openinquiry.ai/overview")
 
     assert outcome.is_success
     rec = outcome.source_record
     assert rec is not None
     assert rec.publication_date is None
     assert rec.publication_date_source is None
-    assert "Zamp automates personalized B2B outreach" in rec.raw_text
+    assert "Open Inquiry automates personalized B2B outreach" in rec.raw_text
 
 
 def test_fetch_malformed_html():

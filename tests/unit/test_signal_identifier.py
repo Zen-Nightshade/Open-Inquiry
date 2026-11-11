@@ -160,7 +160,7 @@ def test_signal_identifier_partial_hallucination_filtered(sample_context):
 
 
 def test_signal_identifier_fallback_on_llm_failure(sample_context):
-    """If LLM fails or errors, identifier executes deterministic fallback from canonical facts."""
+    """If LLM fails or errors, identifier returns empty list (FL-11: zero synthetic fallback signals)."""
     prospect, product = sample_context
 
     fact = CanonicalFact(
@@ -182,7 +182,5 @@ def test_signal_identifier_fallback_on_llm_failure(sample_context):
     identifier = SignalIdentifier(engine=FailingEngine())
     signals = identifier.identify_signals(facts=[fact], prospect=prospect, product=product)
 
-    assert len(signals) == 1
-    assert signals[0].supporting_fact_ids == ["fact-fb-1"]
-    assert "Apex announced new regional distribution hub" in signals[0].description
-    assert signals[0].event_date == datetime.date(2026, 11, 1)
+    assert len(signals) == 0
+

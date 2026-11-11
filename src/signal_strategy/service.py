@@ -54,18 +54,29 @@ class SignalStrategyService:
             )
 
         # Check identity resolution status
-        if research_package.prospect_entity:
-            if research_package.prospect_entity.resolution_status in (
-                ResolutionStatus.AMBIGUOUS,
-                ResolutionStatus.UNRESOLVED,
-            ) and research_package.prospect_entity.confidence in (
-                ConfidenceLevel.LOW,
-                ConfidenceLevel.UNRESOLVED,
-            ):
-                logger.warning(
-                    f"Prospect identity resolution is {research_package.prospect_entity.resolution_status.value} "
-                    f"with confidence {research_package.prospect_entity.confidence.value}."
-                )
+        if research_package.company_entity and research_package.company_entity.resolution_status in (
+            ResolutionStatus.AMBIGUOUS,
+            ResolutionStatus.UNRESOLVED,
+        ):
+            reason = f"Company identity resolution failed with status: {research_package.company_entity.resolution_status.value}."
+            logger.warning(reason)
+            return StrategyResult(
+                is_viable=False,
+                rejection_reason=reason,
+                unviable_reasons=[reason],
+            )
+
+        if research_package.prospect_entity and research_package.prospect_entity.resolution_status in (
+            ResolutionStatus.AMBIGUOUS,
+            ResolutionStatus.UNRESOLVED,
+        ):
+            reason = f"Prospect identity resolution failed with status: {research_package.prospect_entity.resolution_status.value}."
+            logger.warning(reason)
+            return StrategyResult(
+                is_viable=False,
+                rejection_reason=reason,
+                unviable_reasons=[reason],
+            )
 
         # Step 2: Identify candidate signals grounded in facts
         candidate_signals = self.identifier.identify_signals(
@@ -78,7 +89,7 @@ class SignalStrategyService:
             logger.info("Zero candidate signals produced after grounding validation.")
             return StrategyResult(
                 is_viable=False,
-                rejection_reason="No grounded commercial signals could be identified from research facts.",
+                rejection_reason="No qualifying commercial signals identified from factual evidence.",
                 unviable_reasons=["Available facts did not describe commercial events or all candidates failed grounding validation."],
             )
 
@@ -88,6 +99,7 @@ class SignalStrategyService:
             facts=research_package.facts,
             prospect=prospect,
             product=product,
+            research_package=research_package,
         )
 
         # Step 4: Build strategy blueprint with viability gating

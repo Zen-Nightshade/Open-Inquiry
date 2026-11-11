@@ -596,5 +596,5 @@ def test_one_rewrite_maximum_including_reverification():
     assert draft.generation_attempts == 2
     # Second attempt was re-verified and produced error finding, so passed is False
     assert draft.verifier_result.passed is False
-    # Preserved in PENDING_REVIEW regardless
-    assert draft.human_review_status == HumanReviewStatus.PENDING_REVIEW
+    # Draft is quarantined due to verification failure (circuit breaker protects review queue)
+    assert draft.human_review_status == HumanReviewStatus.QUARANTINED_VERIFICATION_FAILED

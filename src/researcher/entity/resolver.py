@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.common.provenance import OutputProvenance, ProvenanceOrigin
 from src.config.settings import GROQ_SMALL
 from src.context.models import ProspectContext
 from src.generator.decoding import DecodeConfig
@@ -237,16 +238,30 @@ class IdentityResolver:
         raw_output: IdentityAssessmentOutput = response.parsed_output
 
         # Enforce deterministic post-LLM guardrails
-        return self._apply_guardrails(prospect, candidates, raw_output)
+        execution_id = response.metadata.get("execution_id") if hasattr(response, "metadata") and response.metadata else None
+        return self._apply_guardrails(
+            prospect,
+            candidates,
+            raw_output,
+            model_execution_id=execution_id,
+            model_name=getattr(response, "model_name", None),
+        )
 
     def _build_empty_resolution_result(self, prospect: ProspectContext) -> IdentityResolutionResult:
         """Construct fallback result when no candidates were discovered."""
+        empty_prov = OutputProvenance(
+            origin=ProvenanceOrigin.DETERMINISTIC_RULE,
+            component="identity_resolver",
+            rule_id="empty_candidates_fallback",
+            is_fallback=True,
+        )
         prospect_entity = EntityRecord(
             entity_type=EntityType.PERSON,
             raw_name=prospect.full_name,
             resolution_status=ResolutionStatus.UNRESOLVED,
             confidence=ConfidenceLevel.UNRESOLVED,
             disambiguation_notes="No candidate entities discovered in research sources.",
+            provenance=empty_prov,
         )
         company_entity = EntityRecord(
             entity_type=EntityType.ORGANIZATION,
@@ -254,6 +269,7 @@ class IdentityResolver:
             resolution_status=ResolutionStatus.UNRESOLVED,
             confidence=ConfidenceLevel.UNRESOLVED,
             disambiguation_notes="No candidate entities discovered in research sources.",
+            provenance=empty_prov,
         )
         return IdentityResolutionResult(
             target_prospect=prospect,
@@ -318,6 +334,8 @@ class IdentityResolver:
         prospect: ProspectContext,
         candidates: List[DiscoveredEntityCandidate],
         output: IdentityAssessmentOutput,
+        model_execution_id: Optional[str] = None,
+        model_name: Optional[str] = None,
     ) -> IdentityResolutionResult:
         """Enforce strict resolution guardrails deterministically over LLM output."""
         valid_candidates_map = {c.candidate_id: c for c in candidates}
@@ -424,6 +442,17 @@ class IdentityResolver:
                         ).strip()
                         break
 
+        guardrail_triggered = (status != output.resolution_status or confidence != output.confidence)
+        prov = OutputProvenance(
+            origin=ProvenanceOrigin.MODEL if not guardrail_triggered else ProvenanceOrigin.DETERMINISTIC_RULE,
+            component="identity_resolver",
+            model_name=model_name,
+            provider=self.provider_name,
+            model_execution_id=model_execution_id,
+            rule_id="identity_resolution_guardrails" if guardrail_triggered else None,
+            is_fallback=guardrail_triggered,
+        )
+
         # Construct final EntityRecord instances
         prospect_entity = EntityRecord(
             entity_type=EntityType.PERSON,
@@ -434,6 +463,7 @@ class IdentityResolver:
             resolution_status=status,
             confidence=confidence,
             disambiguation_notes=disambiguation_notes or None,
+            provenance=prov,
         )
 
         # Company entity resolution status matches or reflects org candidate
@@ -450,6 +480,7 @@ class IdentityResolver:
             resolution_status=company_status,
             confidence=confidence,
             disambiguation_notes=disambiguation_notes or None,
+            provenance=prov,
         )
 
         return IdentityResolutionResult(

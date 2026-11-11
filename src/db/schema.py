@@ -133,6 +133,57 @@ def _ensure_outreach_drafts_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _ensure_outreach_drafts_check_constraint(conn: sqlite3.Connection) -> None:
+    """Ensure outreach_drafts table check constraint includes 'quarantined_verification_failed'."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='outreach_drafts';")
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return
+    sql = row[0]
+    if "quarantined_verification_failed" in sql:
+        return
+
+    cursor.execute("PRAGMA foreign_keys = OFF;")
+    cursor.execute("ALTER TABLE outreach_drafts RENAME TO _outreach_drafts_old;")
+    cursor.execute("""
+    CREATE TABLE outreach_drafts (
+        draft_id              TEXT PRIMARY KEY,
+        context_id            TEXT NOT NULL REFERENCES outreach_contexts(context_id) ON DELETE RESTRICT,
+        research_session_id   TEXT NOT NULL,
+        subject               TEXT NOT NULL,
+        body                  TEXT NOT NULL,
+        word_count            INTEGER NOT NULL,
+        generation_attempt    INTEGER NOT NULL DEFAULT 1,
+        product_snapshot_json TEXT NOT NULL,
+        claim_verifications   TEXT NOT NULL,
+        quality_evaluation    TEXT NOT NULL,
+        human_review_status   TEXT NOT NULL DEFAULT 'pending_review'
+            CHECK (human_review_status IN ('pending_review', 'approved', 'rejected', 'needs_revision', 'quarantined_verification_failed')),
+        reviewer_notes        TEXT,
+        current_revision      INTEGER NOT NULL DEFAULT 1,
+        created_at            TEXT NOT NULL,
+        deleted_at            TEXT
+    );
+    """)
+    cursor.execute("PRAGMA table_info(_outreach_drafts_old);")
+    old_cols = [r["name"] if isinstance(r, sqlite3.Row) else r[1] for r in cursor.fetchall()]
+    target_cols = [
+        "draft_id", "context_id", "research_session_id", "subject", "body",
+        "word_count", "generation_attempt", "product_snapshot_json", "claim_verifications",
+        "quality_evaluation", "human_review_status", "reviewer_notes", "current_revision",
+        "created_at", "deleted_at"
+    ]
+    common_cols = [c for c in target_cols if c in old_cols]
+    cols_str = ", ".join(common_cols)
+    cursor.execute(f"INSERT INTO outreach_drafts ({cols_str}) SELECT {cols_str} FROM _outreach_drafts_old;")
+    cursor.execute("DROP TABLE _outreach_drafts_old;")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outreach_drafts_context ON outreach_drafts(context_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outreach_drafts_session ON outreach_drafts(research_session_id);")
+    cursor.execute("PRAGMA foreign_keys = ON;")
+    conn.commit()
+
+
 def _ensure_human_review_events_columns(conn: sqlite3.Connection) -> None:
     """Ensure newly added columns exist on human_review_events table."""
     cursor = conn.cursor()
@@ -379,6 +430,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _ensure_model_executions_columns(conn)
         _ensure_application_runs_columns(conn)
         _ensure_outreach_drafts_columns(conn)
+        _ensure_outreach_drafts_check_constraint(conn)
         _ensure_human_review_events_columns(conn)
         _ensure_canonical_facts_molecular_columns(conn)
         _ensure_canonical_facts_bitemporal_columns(conn)

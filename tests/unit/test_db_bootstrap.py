@@ -40,10 +40,10 @@ def test_state_store_bootstrap_and_database_status():
         assert "migration_ledger" not in status_after["tables"]
 
 
-def test_runtime_zamp_db_path_environment_override(monkeypatch):
+def test_runtime_open_inquiry_db_path_environment_override(monkeypatch):
     with tempfile.NamedTemporaryFile() as tf:
         custom_path = str(Path(tf.name).resolve())
-        monkeypatch.setenv("ZAMP_DB_PATH", custom_path)
+        monkeypatch.setenv("OPEN_INQUIRY_DB_PATH", custom_path)
 
         # Verify get_db_path resolves the environment variable
         resolved_path = get_db_path()
@@ -60,3 +60,18 @@ def test_runtime_zamp_db_path_environment_override(monkeypatch):
         assert status["is_initialized"] is True
         assert status["is_schema_valid"] is True
         assert status["expected_tables_found"] == 36
+
+
+def test_runtime_legacy_zamp_db_path_fallback(monkeypatch):
+    with tempfile.NamedTemporaryFile() as tf:
+        custom_path = str(Path(tf.name).resolve())
+        monkeypatch.delenv("OPEN_INQUIRY_DB_PATH", raising=False)
+        monkeypatch.setenv("ZAMP_DB_PATH", custom_path)
+
+        with pytest.deprecated_call():
+            resolved_path = get_db_path()
+        assert str(resolved_path) == custom_path
+
+        with pytest.deprecated_call():
+            store = StateStore()
+        assert str(store.db_path) == custom_path

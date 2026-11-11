@@ -55,7 +55,7 @@ def test_context_models_validation_and_immutability():
         prospect.full_name = "John Connor"  # type: ignore
 
     product = ProductContext(
-        product_name="Zamp Automator",
+        product_name="Open Inquiry Automator",
         description="Automated outreach intelligence engine",
         capabilities=["Signal extraction", "Grounded email synthesis"],
         value_proposition="10x SDR productivity",

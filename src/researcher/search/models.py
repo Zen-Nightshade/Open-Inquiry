@@ -40,6 +40,8 @@ class SearchResponse(BaseModel):
     results: List[SearchResult] = Field(default_factory=list, description="List of search results")
     error_message: Optional[str] = Field(default=None, description="Detailed error description if failed")
     duration_ms: Optional[float] = Field(default=None, description="Execution duration in milliseconds")
+    is_transient: bool = Field(default=False, description="Whether failure was determined to be transient")
+    attempts: int = Field(default=1, description="Number of execution attempts made")
 
     @property
     def is_success(self) -> bool:

@@ -203,7 +203,11 @@ class EmailGenerationService:
                 rule_id=f"toulmin_strategy_{strategy.strategy_id}",
             ),
             generation_attempts=attempt,
-            human_review_status=HumanReviewStatus.PENDING_REVIEW,
+            human_review_status=(
+                HumanReviewStatus.QUARANTINED_VERIFICATION_FAILED
+                if (verifier_res and (verifier_res.has_errors or not verifier_res.passed))
+                else HumanReviewStatus.PENDING_REVIEW
+            ),
             human_review_reasons=review_reasons,
         )
 
@@ -266,11 +270,11 @@ class EmailGenerationService:
                     product_snapshot_json=product.model_dump_json(),
                     claim_verifications=json.dumps([cv.model_dump() for cv in draft.claim_verifications]),
                     quality_evaluation=json.dumps(quality_payload),
-                    human_review_status=HumanReviewStatus.PENDING_REVIEW.value,
+                    human_review_status=draft.human_review_status.value,
                     reviewer_notes=None,
                     created_at=datetime.now(timezone.utc).isoformat(),
                 )
-            logger.info("Persisted outreach draft %s for context %s (PENDING_REVIEW)", draft.draft_id, cid)
+            logger.info("Persisted outreach draft %s for context %s (%s)", draft.draft_id, cid, draft.human_review_status.value)
         except Exception as exc:
             logger.error("Failed to persist outreach draft %s to SQLite: %s", draft.draft_id, exc)
             raise DraftPersistenceError(f"Database persistence of outreach draft failed: {exc}") from exc

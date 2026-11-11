@@ -49,8 +49,8 @@ def test_outreach_repository_crud(uow: UnitOfWork):
     # 2. Outreach context & draft
     v = uow.products.create_product_version(
         version_id="v-1",
-        product_name="Zamp Engine",
-        snapshot_json='{"name": "Zamp"}',
+        product_name="Open Inquiry Engine",
+        snapshot_json='{"name": "Open Inquiry"}',
     )
     ctx = uow.outreach.create_outreach_context(
         context_id="ctx-1",
@@ -67,7 +67,7 @@ def test_outreach_repository_crud(uow: UnitOfWork):
         subject="Quick question",
         body="Hi Alex...",
         word_count=50,
-        product_snapshot_json='{"name": "Zamp"}',
+        product_snapshot_json='{"name": "Open Inquiry"}',
         claim_verifications='[]',
         quality_evaluation='{"score": 5}',
     )
