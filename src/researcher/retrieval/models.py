@@ -27,7 +27,7 @@ class RetrievedItem(BaseModel):
     snippet: str = Field(description="Highlighted text snippet with [[MATCH]]...[[/MATCH]] markers")
     raw_text: str = Field(description="Full text or verbatim excerpt")
     rank: float = Field(description="Raw SQLite FTS5 BM25 score (more negative is better match)")
-    score: float = Field(description="Normalized non-negative relevance score (higher is better)")
+    score: float = Field(description="Raw lexical ranking score (unbounded BM25, not a calibrated probability)")
     captured_at: Optional[str] = Field(default=None, description="Original fetch_date or extracted_at timestamp")
     url: Optional[str] = Field(default=None, description="Canonical or original URL")
     domain: Optional[str] = Field(default=None, description="Source domain")

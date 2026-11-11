@@ -63,7 +63,7 @@ from src.researcher.epistemic_dag import (
     GlobalResearchBudget,
     QuestionLifecycleStatus,
 )
-from src.researcher.retrieval import HistoricalRetrievalService, RetrievedRecordType
+from src.researcher.retrieval import HistoricalRetrievalService, RetrievalScope, RetrievedRecordType
 
 logger = logging.getLogger(__name__)
 
@@ -275,13 +275,14 @@ class Researcher:
                     if q.query_text not in accumulator.search_queries_used:
                         accumulator.search_queries_used.append(q.query_text)
 
-                # Step B0: Local Historical Lexical Retrieval (Zero budget consumption)
+                # Step B0: Local Historical Lexical Retrieval (Zero budget consumption, project-scoped)
                 historical_snap_ids: List[str] = []
                 if self.retrieval_service is not None:
                     for q in queries:
                         try:
                             ret_resp = self.retrieval_service.search(
                                 query=q.query_text,
+                                scope=RetrievalScope(project_id=prospect_id),
                                 limit=max_results_per_query,
                             )
                             for item in ret_resp.items:

@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.db.schema import check_fts_integrity, rebuild_fts_indexes
+from src.db.schema import _ensure_fts_indexes, check_fts_integrity, rebuild_fts_indexes
 from src.db.state_store import StateStore
 from src.researcher.retrieval.models import (
     RetrievalResponse,
@@ -23,6 +23,12 @@ class HistoricalRetrievalService:
 
     def __init__(self, state_store: StateStore) -> None:
         self.state_store = state_store
+
+    def _ensure_initialized(self, conn: sqlite3.Connection) -> None:
+        """Ensure SQLite FTS5 virtual tables and synchronization triggers exist, auto-backfilling if missing."""
+        cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_snapshots_fts';")
+        if not cur.fetchone():
+            _ensure_fts_indexes(conn)
 
     def search(
         self,
@@ -61,18 +67,18 @@ class HistoricalRetrievalService:
         count_params: List[Any] = []
 
         if include_snapshots:
-            snap_sql, snap_count_sql, snap_params = self._build_snapshot_query(sanitized, scope)
+            snap_sql, snap_count_sql, snap_params, snap_count_params = self._build_snapshot_query(sanitized, scope)
             subqueries.append(snap_sql)
             count_subqueries.append(snap_count_sql)
             params.extend(snap_params)
-            count_params.extend(snap_params)
+            count_params.extend(snap_count_params)
 
         if include_passages:
-            pass_sql, pass_count_sql, pass_params = self._build_passage_query(sanitized, scope)
+            pass_sql, pass_count_sql, pass_params, pass_count_params = self._build_passage_query(sanitized, scope)
             subqueries.append(pass_sql)
             count_subqueries.append(pass_count_sql)
             params.extend(pass_params)
-            count_params.extend(pass_params)
+            count_params.extend(pass_count_params)
 
         if not subqueries:
             duration_ms = (time.perf_counter() - start_time) * 1000.0
@@ -96,6 +102,7 @@ class HistoricalRetrievalService:
         total_matches = 0
 
         with self.state_store.uow() as uow:
+            self._ensure_initialized(uow.conn)
             # 1. Total matches
             count_cur = uow.conn.execute(count_sql, count_params)
             count_row = count_cur.fetchone()
@@ -126,7 +133,8 @@ class HistoricalRetrievalService:
                     if rec_type_str == "source_snapshot"
                     else RetrievedRecordType.EVIDENCE_RECORD
                 )
-                score = round(abs(bm25_val), 6)
+                # Preserve raw BM25 score without pretending abs() is a normalized probability
+                score = bm25_val
 
                 provenance = {
                     "source_id": src_id,
@@ -171,15 +179,22 @@ class HistoricalRetrievalService:
         self,
         sanitized_query: str,
         scope: RetrievalScope,
-    ) -> Tuple[str, str, List[Any]]:
-        """Construct the SQL subquery for source snapshots."""
-        sql = """
+    ) -> Tuple[str, str, List[Any], List[Any]]:
+        """Construct the SQL subquery for source snapshots with explicit run attribution."""
+        select_params: List[Any] = []
+        if scope.run_id:
+            run_col = "? AS run_id"
+            select_params.append(scope.run_id)
+        else:
+            run_col = "NULL AS run_id"
+
+        sql = f"""
         SELECT
             'source_snapshot' AS record_type,
             s.snapshot_id AS record_id,
             s.source_id,
             s.session_id,
-            (SELECT ar.run_id FROM application_runs ar WHERE ar.research_session_id = s.session_id ORDER BY ar.started_at DESC LIMIT 1) AS run_id,
+            {run_col},
             rs.prospect_id AS project_id,
             s.title,
             snippet(source_snapshots_fts, -1, '[[MATCH]]', '[[/MATCH]]', '...', 15) AS snippet,
@@ -203,7 +218,8 @@ class HistoricalRetrievalService:
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
         WHERE source_snapshots_fts MATCH ?
         """
-        params: List[Any] = [sanitized_query]
+        params: List[Any] = select_params + [sanitized_query]
+        count_params: List[Any] = [sanitized_query]
 
         filter_clauses, filter_params = self._build_scope_filters(scope)
         if filter_clauses:
@@ -211,22 +227,30 @@ class HistoricalRetrievalService:
             sql += clause_str
             count_sql += clause_str
             params.extend(filter_params)
+            count_params.extend(filter_params)
 
-        return sql, count_sql, params
+        return sql, count_sql, params, count_params
 
     def _build_passage_query(
         self,
         sanitized_query: str,
         scope: RetrievalScope,
-    ) -> Tuple[str, str, List[Any]]:
-        """Construct the SQL subquery for evidence passages."""
-        sql = """
+    ) -> Tuple[str, str, List[Any], List[Any]]:
+        """Construct the SQL subquery for evidence passages with explicit run attribution."""
+        select_params: List[Any] = []
+        if scope.run_id:
+            run_col = "? AS run_id"
+            select_params.append(scope.run_id)
+        else:
+            run_col = "NULL AS run_id"
+
+        sql = f"""
         SELECT
             'evidence_record' AS record_type,
             ep.evidence_id AS record_id,
             ep.source_id,
             s.session_id,
-            (SELECT ar.run_id FROM application_runs ar WHERE ar.research_session_id = s.session_id ORDER BY ar.started_at DESC LIMIT 1) AS run_id,
+            {run_col},
             rs.prospect_id AS project_id,
             s.title,
             snippet(evidence_passages_fts, 0, '[[MATCH]]', '[[/MATCH]]', '...', 15) AS snippet,
@@ -252,7 +276,8 @@ class HistoricalRetrievalService:
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
         WHERE evidence_passages_fts MATCH ?
         """
-        params: List[Any] = [sanitized_query]
+        params: List[Any] = select_params + [sanitized_query]
+        count_params: List[Any] = [sanitized_query]
 
         filter_clauses, filter_params = self._build_scope_filters(scope)
         if filter_clauses:
@@ -260,8 +285,9 @@ class HistoricalRetrievalService:
             sql += clause_str
             count_sql += clause_str
             params.extend(filter_params)
+            count_params.extend(filter_params)
 
-        return sql, count_sql, params
+        return sql, count_sql, params, count_params
 
     def _build_scope_filters(self, scope: RetrievalScope) -> Tuple[List[str], List[Any]]:
         """Build WHERE clauses and parameters from a RetrievalScope."""
@@ -293,9 +319,11 @@ class HistoricalRetrievalService:
     def rebuild_indexes(self) -> None:
         """Administrative rebuild of all FTS5 full-text indexes."""
         with self.state_store.uow() as uow:
+            self._ensure_initialized(uow.conn)
             rebuild_fts_indexes(uow.conn)
 
     def verify_integrity(self) -> Dict[str, bool]:
         """Validate integrity of all FTS5 virtual tables."""
         with self.state_store.uow() as uow:
+            self._ensure_initialized(uow.conn)
             return check_fts_integrity(uow.conn)

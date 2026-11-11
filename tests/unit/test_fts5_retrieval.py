@@ -135,9 +135,9 @@ def test_bm25_ranking_and_snippets(populated_store: StateStore):
     assert res.total_matches >= 1
     top_item = res.items[0]
 
-    # Verify score is non-negative and rank is negative (FTS5 BM25 convention)
+    # Verify raw BM25 score (FTS5 BM25 convention: negative, unbounded lexical score)
     assert top_item.rank <= 0.0
-    assert top_item.score >= 0.0
+    assert top_item.score == top_item.rank
 
     # Verify snippet contains markers
     has_match_tag = any("[[MATCH]]" in item.snippet for item in res.items)
