@@ -228,10 +228,12 @@ class EntityRepository:
         relationship_type: str,
         valid_from: Optional[str] = None,
         valid_until: Optional[str] = None,
+        valid_to: Optional[str] = None,
         source_id: Optional[str] = None,
         observed_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = observed_at or datetime.now(timezone.utc).isoformat()
+        effective_until = valid_to or valid_until
         sql = """
         INSERT INTO entity_relationships (
             relationship_id, from_entity_id, to_entity_id, relationship_type,
@@ -246,7 +248,7 @@ class EntityRepository:
                 to_entity_id,
                 relationship_type,
                 valid_from,
-                valid_until,
+                effective_until,
                 source_id,
                 now,
             ),
@@ -256,7 +258,11 @@ class EntityRepository:
             (relationship_id,),
         )
         row = cursor.fetchone()
-        return dict(row) if row else {}
+        if not row:
+            return {}
+        d = dict(row)
+        d["valid_to"] = d.get("valid_until")
+        return d
 
     def get_relationships(self, entity_id: str) -> List[Dict[str, Any]]:
         sql = """
@@ -265,7 +271,12 @@ class EntityRepository:
         ORDER BY observed_at DESC;
         """
         cursor = self.conn.execute(sql, (entity_id, entity_id))
-        return [dict(r) for r in cursor.fetchall()]
+        results = []
+        for r in cursor.fetchall():
+            d = dict(r)
+            d["valid_to"] = d.get("valid_until")
+            results.append(d)
+        return results
 
     # Candidates
     def record_candidate(

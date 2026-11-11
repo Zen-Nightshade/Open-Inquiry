@@ -563,6 +563,7 @@ CREATE TABLE IF NOT EXISTS application_runs (
     strategy_result_json    TEXT,
     stage_statuses_json     TEXT NOT NULL,
     warnings_json           TEXT,
+    feedback_round_json     TEXT,
     error_message           TEXT,
     started_at              TEXT NOT NULL,
     completed_at            TEXT

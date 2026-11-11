@@ -240,6 +240,7 @@ class StateStore:
         error_message: Optional[str] = None,
         completed_at: Optional[str] = None,
         draft_id: Optional[str] = None,
+        feedback_round_json: Optional[str] = None,
     ) -> bool:
         """Update an application run."""
         with self.uow() as uow:
@@ -254,6 +255,7 @@ class StateStore:
                 error_message=error_message,
                 completed_at=completed_at,
                 draft_id=draft_id,
+                feedback_round_json=feedback_round_json,
             )
 
     def list_runs(

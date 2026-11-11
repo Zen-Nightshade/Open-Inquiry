@@ -88,6 +88,7 @@ def _ensure_application_runs_columns(conn: sqlite3.Connection) -> None:
 
     columns_to_add = [
         ("draft_id", "TEXT REFERENCES outreach_drafts(draft_id) ON DELETE SET NULL"),
+        ("feedback_round_json", "TEXT"),
     ]
     for col_name, col_def in columns_to_add:
         if col_name not in cols:

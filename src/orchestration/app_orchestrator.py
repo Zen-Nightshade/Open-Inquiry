@@ -12,8 +12,11 @@ from src.db.state_store import StateStore
 from src.email_generation.generator import EmailGenerationError
 from src.email_generation.models import VerifiedOutreachDraft
 from src.email_generation.service import DraftPersistenceError, EmailGenerationService
-from src.researcher.models import ResearchPackage, ResolutionStatus
+from src.researcher.evidence_request.models import EvidenceFeedbackBudget, FeedbackRoundResult
+from src.researcher.evidence_request.executor import EvidenceRequestExecutor
+from src.researcher.models import ResearchAccumulator, ResearchPackage, ResolutionStatus
 from src.researcher.orchestration.orchestrator import Researcher
+from src.signal_strategy.evidence_requests import EvidenceGapDetector
 from src.signal_strategy.models import StrategyResult
 from src.signal_strategy.service import SignalStrategyService
 from .models import (
@@ -438,6 +441,94 @@ class ApplicationOrchestrator:
             )
 
             # =========================================================================
+            # Stage 5b: Bounded EvidenceRequest Feedback Protocol (M3.1)
+            # =========================================================================
+            feedback_round_result: Optional[FeedbackRoundResult] = None
+            if (not strategy_result.is_viable or (
+                strategy_result.strategy and getattr(strategy_result.strategy, "is_conditional", False)
+            )):
+                s_feedback_start = datetime.now(timezone.utc).isoformat()
+                gap_detector = EvidenceGapDetector(max_requests=3)
+                evidence_requests = gap_detector.detect_gaps_and_create_requests(
+                    strategy_result=strategy_result,
+                    research_package=research_package,
+                    prospect=prospect,
+                    product=product,
+                    run_id=active_run_id,
+                )
+
+                if evidence_requests:
+                    logger.info(
+                        "Executing bounded evidence feedback round for run %s with %d requests",
+                        active_run_id,
+                        len(evidence_requests),
+                    )
+                    feedback_budget = EvidenceFeedbackBudget.create(baseline_budget_units=20)
+                    executor = EvidenceRequestExecutor(researcher=self.researcher, state_store=self.state_store)
+
+                    acc = (
+                        self.researcher._hydrate_accumulator(session_id)
+                        if hasattr(self.researcher, "_hydrate_accumulator")
+                        else ResearchAccumulator(facts=list(research_package.facts), sources=list(research_package.sources))
+                    )
+
+                    feedback_round_result = executor.execute_requests(
+                        requests=evidence_requests,
+                        session_id=session_id,
+                        run_id=active_run_id,
+                        budget=feedback_budget,
+                        accumulator=acc,
+                        round_number=1,
+                    )
+
+                    # Update research package facts from rehydrated accumulator
+                    if hasattr(self.researcher, "_hydrate_accumulator"):
+                        updated_acc = self.researcher._hydrate_accumulator(session_id)
+                    else:
+                        updated_acc = acc
+
+                    research_package = research_package.model_copy(
+                        update={
+                            "facts": list(updated_acc.facts),
+                            "sources": list(updated_acc.sources),
+                        }
+                    )
+
+                    # Re-evaluate strategy with updated research package
+                    re_evaluated_strategy = self.strategy_service.develop_strategy(
+                        research_package=research_package,
+                        prospect=prospect,
+                        product=product,
+                        outreach=outreach,
+                    )
+
+                    if re_evaluated_strategy.is_viable and not (
+                        re_evaluated_strategy.strategy and getattr(re_evaluated_strategy.strategy, "is_conditional", False)
+                    ):
+                        logger.info("Feedback research successfully resolved evidence gaps; strategy is now VIABLE.")
+                        strategy_result = re_evaluated_strategy
+                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
+                    elif re_evaluated_strategy.is_viable:
+                        strategy_result = re_evaluated_strategy
+                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
+                    else:
+                        logger.info("Strategy remains unviable after feedback research.")
+                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_invalidated": True})
+
+                    record_stage(
+                        stage=StageIdentifier.RESEARCH_FEEDBACK,
+                        status=StageStatus.COMPLETED,
+                        started_at=s_feedback_start,
+                        details={
+                            "requests_count": len(evidence_requests),
+                            "budget_consumed": feedback_round_result.budget.feedback_units_consumed,
+                            "budget_cap": feedback_round_result.budget.feedback_budget_cap,
+                            "strategy_became_viable": re_evaluated_strategy.is_viable,
+                            "status": feedback_round_result.status,
+                        },
+                    )
+
+            # =========================================================================
             # Stage 6: Strategy Viability Check & Email Generation
             # =========================================================================
             draft: Optional[VerifiedOutreachDraft] = None
@@ -554,6 +645,7 @@ class ApplicationOrchestrator:
                 research_package=research_package,
                 strategy_result=strategy_result,
                 draft=draft,
+                feedback_round=feedback_round_result,
                 stage_records=stage_records,
                 warnings=warnings,
                 error_message=email_stage_err if (email_stage_status == StageStatus.FAILED) else (strategy_result.rejection_reason if not strategy_result.is_viable else None),
@@ -579,6 +671,7 @@ class ApplicationOrchestrator:
                 research_package=None,
                 strategy_result=None,
                 draft=None,
+                feedback_round=None,
                 stage_records=stage_records,
                 warnings=warnings,
                 error_message=str(exc),
@@ -601,6 +694,7 @@ class ApplicationOrchestrator:
         error_message: Optional[str],
         started_at: str,
         draft: Optional[VerifiedOutreachDraft] = None,
+        feedback_round: Optional[FeedbackRoundResult] = None,
     ) -> RunResult:
         """Atomically persist run completion state, update job record, and return RunResult."""
         completed_at_iso = datetime.now(timezone.utc).isoformat()
@@ -608,6 +702,7 @@ class ApplicationOrchestrator:
         warnings_json = json.dumps(warnings) if warnings else None
         strat_json = strategy_result.model_dump_json() if strategy_result else None
         draft_id = draft.draft_id if draft else None
+        feedback_json = feedback_round.model_dump_json() if feedback_round else None
 
         # 1. Update application_runs row
         self.state_store.update_run(
@@ -617,6 +712,7 @@ class ApplicationOrchestrator:
             strategy_result_json=strat_json,
             stage_statuses_json=stages_json,
             warnings_json=warnings_json,
+            feedback_round_json=feedback_json,
             error_message=error_message,
             completed_at=completed_at_iso,
             draft_id=draft_id,
@@ -644,6 +740,7 @@ class ApplicationOrchestrator:
             research_session_id=research_session_id,
             research_package=research_package,
             strategy_result=strategy_result,
+            feedback_round=feedback_round,
             draft=draft,
             draft_id=draft_id,
             stage_records=stage_records,
@@ -667,6 +764,13 @@ class ApplicationOrchestrator:
         if row.get("strategy_result_json"):
             strategy_result = StrategyResult.model_validate_json(row["strategy_result_json"])
 
+        feedback_round = None
+        if row.get("feedback_round_json"):
+            try:
+                feedback_round = FeedbackRoundResult.model_validate_json(row["feedback_round_json"])
+            except Exception:
+                feedback_round = None
+
         stage_statuses = json.loads(row["stage_statuses_json"]) if row.get("stage_statuses_json") else []
         warnings = json.loads(row["warnings_json"]) if row.get("warnings_json") else []
 
@@ -682,6 +786,7 @@ class ApplicationOrchestrator:
             product=product,
             outreach=outreach,
             strategy_result=strategy_result,
+            feedback_round=feedback_round,
             stage_statuses=stage_statuses,
             warnings=warnings,
             error_message=row.get("error_message"),

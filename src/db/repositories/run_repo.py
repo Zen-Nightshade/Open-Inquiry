@@ -80,6 +80,7 @@ class RunRepository:
         error_message: Optional[str] = None,
         completed_at: Optional[str] = None,
         draft_id: Optional[str] = None,
+        feedback_round_json: Optional[str] = None,
     ) -> bool:
         """Update fields on an existing application run record."""
         assignments: List[str] = []
@@ -106,6 +107,9 @@ class RunRepository:
         if warnings_json is not None:
             assignments.append("warnings_json = ?")
             params.append(warnings_json)
+        if feedback_round_json is not None:
+            assignments.append("feedback_round_json = ?")
+            params.append(feedback_round_json)
         if error_message is not None:
             assignments.append("error_message = ?")
             params.append(error_message)

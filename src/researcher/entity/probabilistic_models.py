@@ -153,9 +153,20 @@ class TypedEntityRelationship(BaseModel):
         default=None,
         description="End of validity interval if terminated; None if ongoing or unknown",
     )
+    valid_to: Optional[str] = Field(
+        default=None,
+        description="Harmonized alias for valid_until matching M2.2 temporal terminology",
+    )
     confidence: ConfidenceLevel = Field(default=ConfidenceLevel.MEDIUM)
     verification_status: VerificationStatus = Field(default=VerificationStatus.SUPPORTED)
     source_id: Optional[str] = Field(default=None, description="Source provenance ID")
     supporting_fact_ids: List[str] = Field(default_factory=list, description="IDs of CanonicalFacts evidencing this relationship")
     provenance: Optional[OutputProvenance] = Field(default=None, description="Origin and rule metadata")
     observed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def __init__(self, **data: Any) -> None:
+        if "valid_to" in data and "valid_until" not in data:
+            data["valid_until"] = data["valid_to"]
+        elif "valid_until" in data and "valid_to" not in data:
+            data["valid_to"] = data["valid_until"]
+        super().__init__(**data)
