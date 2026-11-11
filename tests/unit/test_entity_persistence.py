@@ -353,3 +353,67 @@ def test_atomic_rollback_on_persistence_error(test_state_store: StateStore, samp
         # But Stage 4 changes (assessment, affiliations) were rolled back!
         assessments = uow.entities.get_assessments(session_id=session_id)
         assert len(assessments) == 0
+
+
+def test_decision_metadata_and_canonical_facts_columns_persistence(test_state_store: StateStore, sample_prospect: ProspectContext):
+    """Verify decision_metadata_json persists on identity_assessments and ambiguous_candidates_json/entity_resolution_status persist on canonical_facts."""
+    session_id, prospect_id = _setup_session(test_state_store, sample_prospect)
+
+    test_meta = {
+        "probabilistic_resolution": {
+            "prospect": {
+                "outcome": "ambiguous",
+                "best_score": 0.88,
+                "runner_up_score": 0.84,
+                "margin": 0.04,
+                "competing_candidates": ["cand-1", "cand-2"],
+            }
+        }
+    }
+
+    with test_state_store.uow() as uow:
+        # Create entity in entities table for foreign key constraint
+        uow.entities.create_entity(
+            entity_id=prospect_id,
+            entity_type="person",
+            raw_name=sample_prospect.full_name,
+            resolution_status="ambiguous",
+        )
+
+        # 1. Identity assessment with decision_metadata_json
+        ass = uow.entities.record_identity_assessment(
+            assessment_id="ass-meta-1",
+            session_id=session_id,
+            entity_id=prospect_id,
+            candidate_ids=json.dumps(["cand-1", "cand-2"]),
+            resolution_status="ambiguous",
+            confidence="low",
+            rationale="Ambiguous candidate competition",
+            assessed_by="ProbabilisticEntityResolver",
+            decision_metadata_json=json.dumps(test_meta),
+        )
+        assert ass["decision_metadata_json"] is not None
+        reloaded_meta = json.loads(ass["decision_metadata_json"])
+        assert reloaded_meta["probabilistic_resolution"]["prospect"]["outcome"] == "ambiguous"
+
+        # 2. Canonical fact with ambiguous_candidates_json and entity_resolution_status
+        fact = uow.assertions.create_canonical_fact(
+            fact_id="fact-meta-1",
+            session_id=session_id,
+            claim_text="Acme acquired WidgetCo",
+            fact_category="mergers",
+            composite_confidence="medium",
+            ambiguous_candidates_json=json.dumps(["cand-1", "cand-2"]),
+            entity_resolution_status="ambiguous",
+            independent_source_count=2,
+        )
+        assert fact["entity_resolution_status"] == "ambiguous"
+        assert json.loads(fact["ambiguous_candidates_json"]) == ["cand-1", "cand-2"]
+        assert fact["independent_source_count"] == 2
+
+        # 3. Reload from DB directly
+        reloaded_fact = uow.assertions.get_canonical_fact("fact-meta-1")
+        assert reloaded_fact is not None
+        assert reloaded_fact["entity_resolution_status"] == "ambiguous"
+        assert json.loads(reloaded_fact["ambiguous_candidates_json"]) == ["cand-1", "cand-2"]
+        assert reloaded_fact["independent_source_count"] == 2

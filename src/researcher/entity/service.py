@@ -12,22 +12,33 @@ from src.researcher.entity.candidates import (
     EntityCandidateGenerator,
     normalize_org_name,
 )
+from src.researcher.entity.probabilistic_models import (
+    RelationshipPredicate,
+    ResolutionOutcome,
+    TypedEntityRelationship,
+)
+from src.researcher.entity.probabilistic_resolver import (
+    ProbabilisticEntityResolver,
+    ProbabilisticResolutionResult,
+)
 from src.researcher.entity.resolver import (
     IdentityResolutionResult,
     IdentityResolver,
 )
+from src.researcher.models import ConfidenceLevel, EntityType, ResolutionStatus
 
 logger = logging.getLogger(__name__)
 
 
 class EntityResolutionService:
-    """Orchestrates candidate generation, LLM identity resolution, and database persistence.
+    """Orchestrates candidate generation, probabilistic identity resolution, and database persistence.
     
     Guarantees:
       - Short, strictly bounded UnitOfWork database transactions.
-      - Zero database locks or transactions held open during candidate extraction or LLM calls.
+      - Zero database locks or transactions held open during candidate extraction or resolution.
       - Discovered candidates are persisted before resolution evaluation.
       - Assessments, entities, affiliations (with temporal dates), and identifiers are atomically saved.
+      - Enforces explainable margin separation and uncertainty preservation.
     """
 
     def __init__(
@@ -35,10 +46,12 @@ class EntityResolutionService:
         state_store: StateStore,
         candidate_generator: Optional[EntityCandidateGenerator] = None,
         resolver: Optional[IdentityResolver] = None,
+        probabilistic_resolver: Optional[ProbabilisticEntityResolver] = None,
     ) -> None:
         self.state_store = state_store
         self.candidate_generator = candidate_generator or EntityCandidateGenerator()
         self.resolver = resolver or IdentityResolver()
+        self.probabilistic_resolver = probabilistic_resolver or ProbabilisticEntityResolver()
 
     def resolve_entities_for_session(
         self,
@@ -106,7 +119,18 @@ class EntityResolutionService:
                     source_id=resolved_sid,
                 )
 
-        # Stage 3: LLM Identity Resolution & Guardrail Enforcement (NO DB transaction held!)
+        # Stage 3: Probabilistic Evaluation & Resolution
+        prob_prospect = self.probabilistic_resolver.resolve_candidates(
+            candidates=candidates,
+            target_prospect=prospect,
+            entity_type=EntityType.PERSON,
+        )
+        prob_company = self.probabilistic_resolver.resolve_candidates(
+            candidates=candidates,
+            target_prospect=prospect,
+            entity_type=EntityType.ORGANIZATION,
+        )
+
         result: IdentityResolutionResult = self.resolver.resolve(
             prospect=prospect,
             candidates=candidates,
@@ -114,7 +138,106 @@ class EntityResolutionService:
             session_id=session_id,
         )
 
-        # Stage 4: Persist Entities, Identifiers, Affiliations, and Assessment (Transaction 2 - bounded)
+        p_entity = result.prospect_entity
+        c_entity = result.company_entity
+        status = result.resolution_status
+        conf = result.confidence
+        matched_cids = list(result.matched_candidate_ids)
+        conflicts = list(result.conflicts_or_ambiguities)
+
+        # Enforce probabilistic resolution policy over prospect entity
+        if prob_prospect.outcome == ResolutionOutcome.AMBIGUOUS:
+            p_entity = p_entity.model_copy(
+                update={
+                    "resolution_status": ResolutionStatus.AMBIGUOUS,
+                    "confidence": ConfidenceLevel.LOW,
+                    "disambiguation_notes": prob_prospect.rationale,
+                }
+            )
+            status = ResolutionStatus.AMBIGUOUS
+            conf = ConfidenceLevel.LOW
+            matched_cids = prob_prospect.competing_candidate_ids
+            if prob_prospect.rationale not in conflicts:
+                conflicts.append(prob_prospect.rationale)
+        elif prob_prospect.outcome == ResolutionOutcome.UNRESOLVED:
+            p_entity = p_entity.model_copy(
+                update={
+                    "resolution_status": ResolutionStatus.UNRESOLVED,
+                    "confidence": ConfidenceLevel.UNRESOLVED,
+                    "disambiguation_notes": prob_prospect.rationale,
+                }
+            )
+            status = ResolutionStatus.UNRESOLVED
+            conf = ConfidenceLevel.UNRESOLVED
+            matched_cids = []
+        elif prob_prospect.outcome == ResolutionOutcome.NO_MATCH:
+            if p_entity.resolution_status != ResolutionStatus.PARTIALLY_RESOLVED:
+                p_entity = p_entity.model_copy(
+                    update={
+                        "resolution_status": ResolutionStatus.UNRESOLVED,
+                        "confidence": ConfidenceLevel.LOW,
+                        "disambiguation_notes": prob_prospect.rationale,
+                    }
+                )
+                status = ResolutionStatus.UNRESOLVED
+                conf = ConfidenceLevel.LOW
+                matched_cids = []
+        elif prob_prospect.outcome == ResolutionOutcome.MATCH:
+            if prob_prospect.selected_candidate:
+                cand = prob_prospect.selected_candidate
+                p_entity = p_entity.model_copy(
+                    update={
+                        "resolution_status": ResolutionStatus.RESOLVED,
+                        "confidence": prob_prospect.confidence,
+                        "canonical_name": cand.raw_name,
+                        "disambiguation_notes": prob_prospect.rationale,
+                    }
+                )
+                matched_cids = [prob_prospect.selected_candidate_id]
+                status = ResolutionStatus.RESOLVED
+                conf = prob_prospect.confidence
+
+        # Enforce probabilistic resolution policy over company entity
+        if prob_company.outcome == ResolutionOutcome.AMBIGUOUS:
+            c_entity = c_entity.model_copy(
+                update={
+                    "resolution_status": ResolutionStatus.AMBIGUOUS,
+                    "confidence": ConfidenceLevel.LOW,
+                    "disambiguation_notes": prob_company.rationale,
+                }
+            )
+        elif prob_company.outcome == ResolutionOutcome.UNRESOLVED:
+            c_entity = c_entity.model_copy(
+                update={
+                    "resolution_status": ResolutionStatus.UNRESOLVED,
+                    "confidence": ConfidenceLevel.UNRESOLVED,
+                    "disambiguation_notes": prob_company.rationale,
+                }
+            )
+        elif prob_company.outcome == ResolutionOutcome.MATCH and prob_company.selected_candidate:
+            cand = prob_company.selected_candidate
+            c_entity = c_entity.model_copy(
+                update={
+                    "resolution_status": ResolutionStatus.RESOLVED,
+                    "confidence": prob_company.confidence,
+                    "canonical_name": cand.raw_name,
+                    "domain": cand.domains[0] if cand.domains else c_entity.domain,
+                    "disambiguation_notes": prob_company.rationale,
+                }
+            )
+
+        result = result.model_copy(
+            update={
+                "prospect_entity": p_entity,
+                "company_entity": c_entity,
+                "resolution_status": status,
+                "confidence": conf,
+                "matched_candidate_ids": matched_cids,
+                "conflicts_or_ambiguities": conflicts,
+            }
+        )
+
+        # Stage 4: Persist Entities, Identifiers, Affiliations, Relationships, and Assessment
         with self.state_store.uow() as uow:
             # 1. Upsert or create prospect entity
             existing_p = uow.entities.get_entity(result.prospect_entity.entity_id)
@@ -201,7 +324,7 @@ class EntityResolutionService:
                     alias=alias,
                 )
 
-            # 5. Add affiliations (temporal with start_date and end_date, never single current_company)
+            # 5. Add affiliations and typed temporal relationships (works_for)
             for aff in result.affiliations:
                 org_id = result.company_entity.entity_id
                 if normalize_org_name(aff.organization_name) != normalize_org_name(result.company_entity.raw_name):
@@ -224,7 +347,7 @@ class EntityResolutionService:
                     source_id=aff.source_id,
                 )
 
-            # 6. Add relationships (e.g. acquired_by, subsidiary_of)
+            # 6. Add inter-entity relationships (e.g. acquired_by, subsidiary_of)
             for rel in result.relationships:
                 other_org_id = str(uuid.uuid4())
                 uow.entities.create_entity(
@@ -243,7 +366,22 @@ class EntityResolutionService:
                     source_id=rel.source_id,
                 )
 
-            # 7. Record Identity Assessment
+            # 7. Record Identity Assessment with feature breakdown and thresholds
+            decision_meta = {
+                "prospect_decision": {
+                    "outcome": prob_prospect.outcome.value,
+                    "best_score": prob_prospect.best_score,
+                    "runner_up_score": prob_prospect.runner_up_score,
+                    "score_margin": prob_prospect.score_margin,
+                    "competing_ids": prob_prospect.competing_candidate_ids,
+                    "thresholds": prob_prospect.thresholds,
+                },
+                "company_decision": {
+                    "outcome": prob_company.outcome.value,
+                    "best_score": prob_company.best_score,
+                    "thresholds": prob_company.thresholds,
+                },
+            }
             uow.entities.record_identity_assessment(
                 assessment_id=result.assessment_id,
                 session_id=session_id,
@@ -252,7 +390,8 @@ class EntityResolutionService:
                 resolution_status=result.resolution_status.value,
                 confidence=result.confidence.value,
                 rationale=result.rationale,
-                assessed_by="llm",
+                assessed_by="probabilistic_resolver",
+                decision_metadata_json=json.dumps(decision_meta),
             )
 
         logger.info(

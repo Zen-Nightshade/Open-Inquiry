@@ -26,6 +26,8 @@ class AssertionRepository:
         observed_at: Optional[str] = None,
         recorded_at: Optional[str] = None,
         independent_source_count: Optional[int] = None,
+        ambiguous_candidates_json: Optional[str] = None,
+        entity_resolution_status: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = created_at or datetime.now(timezone.utc).isoformat()
@@ -37,8 +39,9 @@ class AssertionRepository:
         INSERT INTO canonical_facts (
             fact_id, session_id, claim_text, fact_category,
             primary_event_date, composite_confidence, molecular_data_json,
-            valid_from, valid_to, observed_at, recorded_at, independent_source_count, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            valid_from, valid_to, observed_at, recorded_at, independent_source_count,
+            ambiguous_candidates_json, entity_resolution_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(fact_id) DO UPDATE SET
             composite_confidence = excluded.composite_confidence,
             primary_event_date = coalesce(canonical_facts.primary_event_date, excluded.primary_event_date),
@@ -47,7 +50,9 @@ class AssertionRepository:
             valid_to = coalesce(excluded.valid_to, canonical_facts.valid_to),
             observed_at = coalesce(excluded.observed_at, canonical_facts.observed_at),
             recorded_at = coalesce(excluded.recorded_at, canonical_facts.recorded_at),
-            independent_source_count = coalesce(excluded.independent_source_count, canonical_facts.independent_source_count);
+            independent_source_count = coalesce(excluded.independent_source_count, canonical_facts.independent_source_count),
+            ambiguous_candidates_json = coalesce(excluded.ambiguous_candidates_json, canonical_facts.ambiguous_candidates_json),
+            entity_resolution_status = coalesce(excluded.entity_resolution_status, canonical_facts.entity_resolution_status);
         """
         self.conn.execute(
             sql,
@@ -64,6 +69,8 @@ class AssertionRepository:
                 obs_at,
                 rec_at,
                 independent_source_count,
+                ambiguous_candidates_json,
+                entity_resolution_status,
                 now,
             ),
         )

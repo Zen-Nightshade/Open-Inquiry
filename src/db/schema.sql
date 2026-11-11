@@ -408,6 +408,7 @@ CREATE TABLE IF NOT EXISTS identity_assessments (
     confidence        TEXT NOT NULL,
     rationale         TEXT NOT NULL,
     assessed_by       TEXT NOT NULL,
+    decision_metadata_json TEXT,
     assessed_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_identity_assessments_session ON identity_assessments(session_id);
@@ -430,6 +431,8 @@ CREATE TABLE IF NOT EXISTS canonical_facts (
     observed_at          TEXT,
     recorded_at          TEXT,
     independent_source_count INTEGER,
+    ambiguous_candidates_json TEXT,
+    entity_resolution_status TEXT,
     created_at           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_canonical_facts_session ON canonical_facts(session_id);

@@ -313,14 +313,16 @@ class EntityRepository:
         confidence: str,
         rationale: str,
         assessed_by: str,
+        decision_metadata_json: Optional[str] = None,
         assessed_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = assessed_at or datetime.now(timezone.utc).isoformat()
         sql = """
         INSERT INTO identity_assessments (
             assessment_id, session_id, entity_id, candidate_ids,
-            resolution_status, confidence, rationale, assessed_by, assessed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            resolution_status, confidence, rationale, assessed_by,
+            decision_metadata_json, assessed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         self.conn.execute(
             sql,
@@ -333,6 +335,7 @@ class EntityRepository:
                 confidence,
                 rationale,
                 assessed_by,
+                decision_metadata_json,
                 now,
             ),
         )

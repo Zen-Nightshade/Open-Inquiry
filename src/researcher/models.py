@@ -171,6 +171,14 @@ class CanonicalFact(BaseModel):
         default=None,
         description="Number of independent source clusters corroborating this fact",
     )
+    ambiguous_candidate_ids: List[str] = Field(
+        default_factory=list,
+        description="Candidate entity IDs when identity attribution is ambiguous and cannot be collapsed to a single entity ID",
+    )
+    entity_resolution_status: Optional[str] = Field(
+        default=None,
+        description="Outcome of entity resolution for this fact (match, ambiguous, unresolved, no_match)",
+    )
 
     @property
     def source_ids(self) -> List[str]:
@@ -280,6 +288,7 @@ class ResearchAccumulator:
         match_fact_id: Optional[str] = None,
         is_independent: bool = True,
         syndication_groups: Optional[Dict[str, Set[str]]] = None,
+        source_domains: Optional[Dict[str, str]] = None,
     ) -> None:
         """Add a new fact or merge evidence into an existing fact without losing source evidence."""
         if match_fact_id is not None:
@@ -300,18 +309,39 @@ class ResearchAccumulator:
                             existing_ev_tuples.add((new_ev.source_id, new_ev.verbatim_excerpt))
 
                     merged_entity_ids = list(dict.fromkeys(existing.entity_ids + new_fact.entity_ids))
+                    merged_ambiguous_cands = list(
+                        dict.fromkeys(existing.ambiguous_candidate_ids + new_fact.ambiguous_candidate_ids)
+                    )
                     unique_sources = list(dict.fromkeys(ev.source_id for ev in merged_evidence))
 
-                    # Map sources through syndication groups to calculate independent clusters
+                    # Map sources through syndication groups and domain origins
+                    source_to_cluster: Dict[str, str] = {}
                     if syndication_groups:
-                        source_to_cluster: Dict[str, str] = {}
                         for cluster_id, member_ids in syndication_groups.items():
                             for member_id in member_ids:
                                 source_to_cluster[member_id] = cluster_id
-                        independent_clusters = {source_to_cluster.get(s, s) for s in unique_sources}
-                        indep_count = len(independent_clusters)
-                    else:
+
+                    if source_domains:
+                        for s_id, s_dom in source_domains.items():
+                            if s_id not in source_to_cluster and s_dom:
+                                source_to_cluster[s_id] = f"domain:{s_dom.strip().lower()}"
+
+                    # Group sources into clusters
+                    independent_clusters = set()
+                    unknown_sources = 0
+                    for s in unique_sources:
+                        if s in source_to_cluster:
+                            independent_clusters.add(source_to_cluster[s])
+                        else:
+                            unknown_sources += 1
+
+                    # Count confirmed independent clusters; unknown dependence capped conservatively
+                    if syndication_groups is None and source_domains is None:
                         indep_count = len(unique_sources) if is_independent else 1
+                    else:
+                        indep_count = len(independent_clusters) + (1 if unknown_sources > 0 else 0)
+                        if not is_independent and indep_count > 1:
+                            indep_count = 1
 
                     # Confidence calibration:
                     # Keep source credibility and evidence independence as separate dimensions.
@@ -331,6 +361,12 @@ class ResearchAccumulator:
                     else:
                         composite_conf = existing.composite_confidence
 
+                    merged_status = existing.entity_resolution_status or new_fact.entity_resolution_status
+                    if merged_ambiguous_cands or "ambiguous" in (existing.entity_resolution_status, new_fact.entity_resolution_status):
+                        merged_status = "ambiguous"
+                    elif "unresolved" in (existing.entity_resolution_status, new_fact.entity_resolution_status):
+                        merged_status = "unresolved"
+
                     updated = CanonicalFact(
                         fact_id=existing.fact_id,
                         claim_text=existing.claim_text,
@@ -346,21 +382,36 @@ class ResearchAccumulator:
                         observed_at=existing.observed_at or new_fact.observed_at,
                         recorded_at=existing.recorded_at or new_fact.recorded_at,
                         independent_source_count=indep_count,
+                        ambiguous_candidate_ids=merged_ambiguous_cands,
+                        entity_resolution_status=merged_status,
                     )
                     self.facts[idx] = updated
                     return
 
         # Add new fact
         if new_fact.independent_source_count is None:
-            if syndication_groups:
-                source_to_cluster = {}
-                for cluster_id, member_ids in syndication_groups.items():
-                    for member_id in member_ids:
-                        source_to_cluster[member_id] = cluster_id
-                indep_clusters = {source_to_cluster.get(s, s) for s in new_fact.source_ids}
-                indep_count = len(indep_clusters)
-            else:
+            if syndication_groups is None and source_domains is None:
                 indep_count = len(new_fact.source_ids)
+            else:
+                source_to_cluster = {}
+                if syndication_groups:
+                    for cluster_id, member_ids in syndication_groups.items():
+                        for member_id in member_ids:
+                            source_to_cluster[member_id] = cluster_id
+
+                if source_domains:
+                    for s_id, s_dom in source_domains.items():
+                        if s_id not in source_to_cluster and s_dom:
+                            source_to_cluster[s_id] = f"domain:{s_dom.strip().lower()}"
+
+                indep_clusters = set()
+                unknown_count = 0
+                for s in new_fact.source_ids:
+                    if s in source_to_cluster:
+                        indep_clusters.add(source_to_cluster[s])
+                    else:
+                        unknown_count += 1
+                indep_count = len(indep_clusters) + (1 if unknown_count > 0 else 0)
 
             fact_to_add = CanonicalFact(
                 fact_id=new_fact.fact_id,
@@ -377,6 +428,8 @@ class ResearchAccumulator:
                 observed_at=new_fact.observed_at,
                 recorded_at=new_fact.recorded_at,
                 independent_source_count=indep_count,
+                ambiguous_candidate_ids=new_fact.ambiguous_candidate_ids,
+                entity_resolution_status=new_fact.entity_resolution_status,
             )
             self.facts.append(fact_to_add)
         else:

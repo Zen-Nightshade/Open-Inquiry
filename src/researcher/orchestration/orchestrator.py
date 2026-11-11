@@ -44,6 +44,17 @@ from src.researcher.search.followup_generator import FollowUpQueryGenerator
 from src.researcher.search.models import SearchResponse, SearchStatus
 from src.researcher.search.query_generator import GeneratedQuery, QueryGenerator
 from src.researcher.search.search_client import SearchClient
+from src.researcher.syndication.detector import SyndicationDetector
+from src.researcher.syndication.minhash import compute_minhash_signature
+from src.researcher.syndication.normalizer import (
+    compute_normalized_content_hash,
+    compute_raw_content_hash,
+    normalize_source_text,
+)
+from src.researcher.syndication.shingling import (
+    generate_5gram_shingles,
+    tokenize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +73,7 @@ class Researcher:
         entity_service: Optional[EntityResolutionService] = None,
         fact_service: Optional[FactExtractionService] = None,
         evaluator: Optional[ResearchSufficiencyEvaluator] = None,
+        syndication_detector: Optional[SyndicationDetector] = None,
     ) -> None:
         self.state_store = state_store
         self.planner = planner or ResearchPlanner()
@@ -72,6 +84,7 @@ class Researcher:
         self.entity_service = entity_service or EntityResolutionService(state_store=self.state_store)
         self.fact_service = fact_service or FactExtractionService(state_store=self.state_store)
         self.evaluator = evaluator or ResearchSufficiencyEvaluator()
+        self.syndication_detector = syndication_detector or SyndicationDetector()
 
     def conduct_research(
         self,
@@ -567,6 +580,14 @@ class Researcher:
 
                 if outcome.status == FetchStatus.SUCCESS and outcome.source_record:
                     sr = outcome.source_record.model_copy(update={"source_id": source_id})
+                    raw_hash = compute_raw_content_hash(sr.raw_text)
+                    norm_hash = compute_normalized_content_hash(sr.raw_text)
+                    norm_text = normalize_source_text(sr.raw_text)
+                    tokens = tokenize(norm_text)
+                    shingles = generate_5gram_shingles(tokens)
+                    minhash_sig = compute_minhash_signature(shingles)
+                    minhash_sig_str = json.dumps(list(minhash_sig))
+
                     uow.sources.create_snapshot(
                         snapshot_id=snapshot_id,
                         source_id=source_id,
@@ -579,9 +600,20 @@ class Researcher:
                         raw_text=sr.raw_text,
                         http_status_code=outcome.http_status_code or 200,
                         duration_ms=outcome.duration_ms,
+                        raw_content_hash=raw_hash,
+                        normalized_content_hash=norm_hash,
+                        minhash_signature=minhash_sig_str,
                     )
                     created_snapshot_ids.append(snapshot_id)
                     accumulator.add_source(sr)
+
+        # Run Syndication Detection on all accumulated sources and persist clusters
+        if len(accumulator.sources) >= 2:
+            detection_res = self.syndication_detector.detect_syndication(accumulator.sources)
+            if detection_res.clusters:
+                with self.state_store.uow() as uow:
+                    for cluster in detection_res.clusters:
+                        uow.sources.save_syndication_cluster(cluster)
 
         return created_snapshot_ids
 

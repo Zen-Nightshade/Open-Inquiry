@@ -240,6 +240,25 @@ def _ensure_canonical_facts_syndication_columns(conn: sqlite3.Connection) -> Non
     conn.commit()
 
 
+def _ensure_entity_resolution_columns(conn: sqlite3.Connection) -> None:
+    """Ensure newly added ambiguous candidate attribution and decision metadata columns exist idempotently."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(canonical_facts);")
+    c_cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if c_cols:
+        if "ambiguous_candidates_json" not in c_cols:
+            conn.execute("ALTER TABLE canonical_facts ADD COLUMN ambiguous_candidates_json TEXT;")
+        if "entity_resolution_status" not in c_cols:
+            conn.execute("ALTER TABLE canonical_facts ADD COLUMN entity_resolution_status TEXT;")
+
+    cursor.execute("PRAGMA table_info(identity_assessments);")
+    a_cols = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in cursor.fetchall()}
+    if a_cols:
+        if "decision_metadata_json" not in a_cols:
+            conn.execute("ALTER TABLE identity_assessments ADD COLUMN decision_metadata_json TEXT;")
+    conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Execute the authoritative schema script against the provided connection idempotently.
     
@@ -259,6 +278,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         _ensure_source_snapshots_syndication_columns(conn)
         _ensure_evidence_origin_columns(conn)
         _ensure_canonical_facts_syndication_columns(conn)
+        _ensure_entity_resolution_columns(conn)
     except Exception as exc:
         raise RuntimeError(f"Failed to initialize database schema: {exc}") from exc
 

@@ -79,17 +79,17 @@ class FactExtractionService:
             logger.info("No validated facts extracted for snapshot %s", snapshot_id)
             return []
 
-        # Step 3: Read syndication origin groups for independence checking
-        syndication_groups: Dict[str, Set[str]] = {}
-        source_domains: Dict[str, str] = {source_id: source_domain}
-
+        # Step 3: Read syndication origin groups and all source domains for independence checking
         with self.state_store.uow() as uow:
-            # Query origin members if any
-            cursor = uow.conn.execute("SELECT group_id, source_id FROM evidence_origin_members;")
-            for gid, sid in cursor.fetchall():
-                if gid not in syndication_groups:
-                    syndication_groups[gid] = set()
-                syndication_groups[gid].add(sid)
+            syndication_groups = uow.sources.get_syndication_groups()
+            all_sources = uow.sources.list_sources()
+            source_domains: Dict[str, str] = {
+                s["source_id"]: s["domain"]
+                for s in all_sources
+                if s.get("source_id") and s.get("domain")
+            }
+            if source_id and source_domain:
+                source_domains[source_id] = source_domain
 
         # Step 4: Consolidate with accumulator, preloading existing session facts if needed
         active_acc = accumulator or ResearchAccumulator()
@@ -110,6 +110,11 @@ class FactExtractionService:
                         for e in db_ev
                     ]
                     linked_ents = uow.assertions.get_entities_for_fact(df["fact_id"])
+                    ambig_cids = (
+                        json.loads(df["ambiguous_candidates_json"])
+                        if df.get("ambiguous_candidates_json")
+                        else []
+                    )
                     c_fact = CanonicalFact(
                         fact_id=df["fact_id"],
                         claim_text=df["claim_text"],
@@ -129,6 +134,9 @@ class FactExtractionService:
                         valid_to=df.get("valid_to"),
                         observed_at=df.get("observed_at"),
                         recorded_at=df.get("recorded_at"),
+                        independent_source_count=df.get("independent_source_count"),
+                        ambiguous_candidate_ids=ambig_cids,
+                        entity_resolution_status=df.get("entity_resolution_status"),
                     )
                     active_acc.facts.append(c_fact)
 
@@ -140,9 +148,60 @@ class FactExtractionService:
         )
 
         # Step 5: Persist facts, passages, links, and conflicts (Short Bounded Transaction)
+        persisted_facts: List[CanonicalFact] = []
         with self.state_store.uow() as uow:
+            # Build entity status lookup from known_entities or database
+            entity_status_lookup: Dict[str, str] = {}
+            if known_entities:
+                for ke in known_entities:
+                    stat = ke.resolution_status.value if hasattr(ke.resolution_status, "value") else str(ke.resolution_status)
+                    entity_status_lookup[ke.entity_id] = stat
+
             for fact in consolidation_result.consolidated_facts:
+                fact_res_status = fact.entity_resolution_status
+                ambiguous_cids = list(fact.ambiguous_candidate_ids)
+                confirmed_entity_ids: List[str] = []
+
+                for eid in fact.entity_ids:
+                    status = entity_status_lookup.get(eid)
+                    if not status:
+                        db_ent = uow.entities.get_entity(eid)
+                        if db_ent:
+                            status = db_ent.get("resolution_status", "unresolved")
+                            entity_status_lookup[eid] = status
+
+                    if status == "ambiguous":
+                        if eid not in ambiguous_cids:
+                            ambiguous_cids.append(eid)
+                        fact_res_status = "ambiguous"
+                    elif status == "unresolved":
+                        if not fact_res_status or fact_res_status == "match":
+                            fact_res_status = "unresolved"
+                    elif status == "resolved":
+                        confirmed_entity_ids.append(eid)
+                        if not fact_res_status:
+                            fact_res_status = "match"
+                    else:
+                        confirmed_entity_ids.append(eid)
+
+                if ambiguous_cids:
+                    fact_res_status = "ambiguous"
+
+                if fact_res_status != fact.entity_resolution_status or ambiguous_cids != fact.ambiguous_candidate_ids:
+                    fact = fact.model_copy(
+                        update={
+                            "entity_resolution_status": fact_res_status,
+                            "ambiguous_candidate_ids": ambiguous_cids,
+                        }
+                    )
+                persisted_facts.append(fact)
+
                 # 1. Create or update canonical fact
+                ambiguous_json = (
+                    json.dumps(fact.ambiguous_candidate_ids)
+                    if fact.ambiguous_candidate_ids
+                    else None
+                )
                 uow.assertions.create_canonical_fact(
                     fact_id=fact.fact_id,
                     session_id=session_id,
@@ -161,14 +220,18 @@ class FactExtractionService:
                     valid_to=fact.valid_to,
                     observed_at=fact.observed_at,
                     recorded_at=fact.recorded_at,
+                    independent_source_count=fact.independent_source_count,
+                    ambiguous_candidates_json=ambiguous_json,
+                    entity_resolution_status=fact.entity_resolution_status,
                 )
 
                 # 2. Link fact to entities
                 for eid in fact.entity_ids:
-                    uow.assertions.link_fact_entity(
-                        fact_id=fact.fact_id,
-                        entity_id=eid,
-                    )
+                    if uow.entities.get_entity(eid):
+                        uow.assertions.link_fact_entity(
+                            fact_id=fact.fact_id,
+                            entity_id=eid,
+                        )
 
                 # 3. Create evidence passages and link to fact
                 for ev in fact.evidence_records:
@@ -232,4 +295,4 @@ class FactExtractionService:
             session_id,
             snapshot_id,
         )
-        return consolidation_result.consolidated_facts
+        return persisted_facts
