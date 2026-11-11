@@ -27,6 +27,8 @@ class GeneratedQuery(BaseModel):
     query_text: str = Field(min_length=3, description="Plain human search query string")
     objective_id: Optional[str] = Field(default=None, description="Traceability link to the originating ResearchObjective")
     target_entity: TargetEntity = Field(description="Whether this query targets the prospect, company, or both")
+    parent_question_id: Optional[str] = Field(default=None, description="Parent DAG question ID if generated from multi-hop dependency")
+    supporting_fact_ids: List[str] = Field(default_factory=list, description="IDs of resolved parent facts used for context injection")
 
 
 class QueryListOutput(BaseModel):
@@ -48,7 +50,8 @@ Rules:
 4. Focus Separation:
    - For 'prospect' targets: Include the person's name and company or career context.
    - For 'company' targets: Include the company name and commercial terms (e.g., funding, product, expansion, hiring, customers).
-5. No Unsupported Assumptions: Do not assume unstated events or technologies without grounding.
+5. Parent Discovery Context: When discovered parent entities are provided (e.g. parent company, subsidiary, holding group), incorporate the discovered entity names into child queries (e.g. 'Alphabet CFO' instead of generic 'Company CFO') to fulfill multi-hop research, while preserving the child objective.
+6. No Unsupported Assumptions: Do not assume unstated events or technologies without grounding.
 
 Output format: You must respond ONLY with a JSON object containing a 'queries' list of strings."""
 
@@ -70,10 +73,23 @@ class QueryGenerator:
         objective: ResearchObjective,
         prospect: ProspectContext,
         existing_queries: Optional[List[str]] = None,
+        contextual_entities: Optional[List[str]] = None,
+        parent_context: Optional[Dict[str, Any]] = None,
+        parent_question_id: Optional[str] = None,
+        supporting_fact_ids: Optional[List[str]] = None,
     ) -> List[GeneratedQuery]:
-        """Generate a list of unique search queries mapped to the supplied objective."""
+        """Generate a list of unique search queries mapped to the supplied objective, optionally interpolating parent context."""
         known_queries: Set[str] = {q.strip().lower() for q in (existing_queries or []) if q.strip()}
-        user_prompt = self._build_prompt_content(objective, prospect)
+        
+        # Bound contextual entities count (max 3) and sanitize
+        bounded_entities = [e.strip()[:60] for e in (contextual_entities or []) if e and e.strip()][:3]
+
+        user_prompt = self._build_prompt_content(
+            objective=objective,
+            prospect=prospect,
+            contextual_entities=bounded_entities,
+            parent_context=parent_context,
+        )
 
         prompt = Prompt()
         prompt.add_message(Message(role=Role.SYSTEM, content=QUERY_GENERATOR_SYSTEM_PROMPT))
@@ -106,6 +122,10 @@ class QueryGenerator:
 
         for q_text in raw_queries:
             cleaned = self._clean_query(q_text)
+            # Enforce bounded query length (max 120 chars)
+            if len(cleaned) > 120:
+                cleaned = cleaned[:120].rsplit(" ", 1)[0].strip()
+
             norm = cleaned.lower()
 
             if not cleaned or len(cleaned) < 3:
@@ -119,6 +139,8 @@ class QueryGenerator:
                     query_text=cleaned,
                     objective_id=objective.objective_id,
                     target_entity=objective.target_entity,
+                    parent_question_id=parent_question_id,
+                    supporting_fact_ids=list(supporting_fact_ids or []),
                 )
             )
 
@@ -151,6 +173,8 @@ class QueryGenerator:
         self,
         objective: ResearchObjective,
         prospect: ProspectContext,
+        contextual_entities: Optional[List[str]] = None,
+        parent_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         lines = [
             "### Research Objective",
@@ -167,7 +191,22 @@ class QueryGenerator:
             f"- Company Domain: {prospect.company_domain or 'Unknown'}",
             f"- Designation: {prospect.designation or 'Unknown'}",
             f"- Location: {prospect.location or 'Unknown'}",
+        ]
+
+        if contextual_entities:
+            lines.append("")
+            lines.append("### Discovered Parent Entity Context (Multi-Hop)")
+            for ent in contextual_entities:
+                lines.append(f"- Discovered Parent Entity/Attribute: {ent}")
+
+        if parent_context:
+            lines.append("")
+            lines.append("### Parent Objective Findings")
+            for k, v in parent_context.items():
+                lines.append(f"- {k}: {v}")
+
+        lines.extend([
             "",
             f"Generate up to {objective.max_queries} distinct, high-signal plain search queries targeting this objective.",
-        ]
+        ])
         return "\n".join(lines)

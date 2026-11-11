@@ -121,6 +121,67 @@ class EpistemicDAGScheduler:
         return (selected_nodes, current_dag)
 
     @classmethod
+    def should_terminate_research(
+        cls,
+        dag: EpistemicQuestionDAG,
+        budget: Optional[GlobalResearchBudget] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Determine whether DAG-governed research has reached an authoritative stopping condition."""
+        if budget is not None and budget.is_exhausted:
+            return (True, "Global research budget exhausted")
+
+        all_nodes = list(dag.nodes.values())
+        if not all_nodes:
+            return (True, "DAG contains no question nodes")
+
+        terminal_statuses = {
+            QuestionLifecycleStatus.RESOLVED,
+            QuestionLifecycleStatus.UNOBSERVABLE,
+            QuestionLifecycleStatus.EXHAUSTED,
+            QuestionLifecycleStatus.SKIPPED,
+        }
+
+        # 1. All nodes are terminal
+        if all(node.status in terminal_statuses for node in all_nodes):
+            if all(node.status == QuestionLifecycleStatus.UNOBSERVABLE for node in all_nodes):
+                return (True, "All questions determined unobservable")
+            if all(node.status == QuestionLifecycleStatus.RESOLVED for node in all_nodes):
+                return (True, "All questions resolved")
+            return (True, "All questions reached terminal states")
+
+        # 2. Check for deadlock / dependency blocks
+        non_terminal = [n for n in all_nodes if n.status not in terminal_statuses]
+        executable_candidates = []
+        for n in non_terminal:
+            unmet_deps = [
+                dep for dep in n.dependencies
+                if dep in dag.nodes and dag.nodes[dep].status != QuestionLifecycleStatus.RESOLVED
+            ]
+            if not unmet_deps:
+                executable_candidates.append(n)
+            else:
+                # If any dependency is terminal and unresolvable (e.g. unobservable/depleted/skipped),
+                # this child question can never execute.
+                unresolvable_parents = [
+                    dep for dep in unmet_deps
+                    if dag.nodes[dep].status in (
+                        QuestionLifecycleStatus.UNOBSERVABLE,
+                        QuestionLifecycleStatus.EXHAUSTED,
+                        QuestionLifecycleStatus.SKIPPED,
+                    )
+                ]
+                # If parent will never resolve, child cannot execute
+                if len(unresolvable_parents) == len(unmet_deps):
+                    pass
+
+        in_progress = [n for n in all_nodes if n.status == QuestionLifecycleStatus.IN_PROGRESS]
+        if not executable_candidates and not in_progress:
+            # Check if remaining non-terminal nodes are permanently blocked
+            return (True, "All remaining questions dependency blocked or unresolvable")
+
+        return (False, None)
+
+    @classmethod
     def record_node_outcome(
         cls,
         dag: EpistemicQuestionDAG,

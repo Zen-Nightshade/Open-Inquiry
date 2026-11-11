@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from src.context.models import OutreachContext, ProductContext, ProspectContext
 from src.db.state_store import StateStore
@@ -109,14 +109,18 @@ class Researcher:
         max_results_per_query: int = 5,
         max_pages_to_fetch_per_iter: int = 6,
         budget: Optional[GlobalResearchBudget] = None,
+        project_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> ResearchPackage:
-        """Execute full multi-turn research lifecycle with sufficiency evaluation and checkpointed recovery."""
         active_session_id = session_id or str(uuid.uuid4())
         active_context_id = context_id or str(uuid.uuid4())
 
         # Ensure prospect is persisted
         prospect_record = self._ensure_prospect_persisted(prospect)
         prospect_id = prospect_record["prospect_id"]
+        effective_project_id = project_id or context_id or prospect_id
+        effective_company_domain = prospect.company_domain or prospect_record.get("company_domain")
+        effective_run_id = run_id or active_session_id
 
         # Ensure session row exists
         with self.state_store.uow() as uow:
@@ -170,6 +174,7 @@ class Researcher:
         is_sufficient = False
         is_complete = False
         final_assessment: Optional[ResearchSufficiencyAssessment] = latest_assessment
+        dag_terminal_reason: Optional[str] = None
 
         # Multi-turn Iteration Loop
         while current_iter_num <= max_iterations:
@@ -200,6 +205,14 @@ class Researcher:
             logger.info("Executing research turn %d of %d (Session: %s)", current_iter_num, max_iterations, active_session_id)
 
             try:
+                # Step A0: Check DAG Termination & Global Budget State
+                dag_should_stop, stop_reason = EpistemicDAGScheduler.should_terminate_research(dag, budget=active_budget)
+                if dag_should_stop:
+                    dag_terminal_reason = stop_reason
+                    logger.info("DAG Scheduler: Termination condition met in turn %d (%s); halting iterations.", current_iter_num, stop_reason)
+                    is_complete = True
+                    break
+
                 # Step A: DAG-Driven Question Selection & Query Generation
                 selected_nodes, dag = EpistemicDAGScheduler.select_next_batch(
                     dag=dag,
@@ -208,57 +221,131 @@ class Researcher:
                 )
                 accumulator.question_dag = dag
 
+                if not selected_nodes:
+                    dag_should_stop, stop_reason = EpistemicDAGScheduler.should_terminate_research(dag, budget=active_budget)
+                    dag_terminal_reason = stop_reason or "No ready questions in DAG"
+                    logger.info("DAG Scheduler: 0 questions ready in turn %d (%s); halting iterations.", current_iter_num, dag_terminal_reason)
+                    is_complete = True
+                    if dag.is_fully_resolved:
+                        is_sufficient = True
+                    break
+
                 queries: List[GeneratedQuery] = []
                 queries_by_node: Dict[str, List[GeneratedQuery]] = {}
 
-                if selected_nodes:
-                    for node in selected_nodes:
-                        node_queries: List[GeneratedQuery] = []
-                        matching_obj = next(
-                            (obj for obj in objectives if f"qn_{obj.objective_id.replace('-', '')[:10]}" == node.question_id),
-                            None,
-                        )
-                        if matching_obj and current_iter_num == 1:
+                for node in selected_nodes:
+                    node_queries: List[GeneratedQuery] = []
+                    matching_obj = next(
+                        (obj for obj in objectives if f"qn_{obj.objective_id.replace('-', '')[:10]}" == node.question_id),
+                        None,
+                    )
+
+                    # Multi-hop Dependency Context Injection
+                    parent_ids = list(node.dependencies or [])
+                    contextual_entities: List[str] = []
+                    parent_context_str: Optional[str] = None
+                    resolved_parent_fact_ids: List[str] = []
+                    primary_parent_id: Optional[str] = parent_ids[0] if parent_ids else None
+
+                    for pid in parent_ids:
+                        if pid in dag.nodes:
+                            pnode = dag.get_node(pid)
+                            if pnode.status == QuestionLifecycleStatus.RESOLVED:
+                                p_facts = [f for f in accumulator.facts if f.fact_id in pnode.resulting_fact_ids]
+                                for pf in p_facts:
+                                    resolved_parent_fact_ids.append(pf.fact_id)
+                                    if pf.claim_text:
+                                        if not parent_context_str:
+                                            parent_context_str = pf.claim_text[:120]
+                                        else:
+                                            parent_context_str = f"{parent_context_str}; {pf.claim_text[:80]}"
+                                        contextual_entities.append(pf.claim_text.strip()[:60])
+
+                    contextual_entities = contextual_entities[:3]
+
+                    if matching_obj:
+                        try:
                             node_queries = self.query_generator.generate_queries(
                                 objective=matching_obj,
                                 prospect=prospect,
                                 existing_queries=accumulator.search_queries_used,
+                                contextual_entities=contextual_entities,
+                                parent_context=parent_context_str,
+                                parent_question_id=primary_parent_id,
+                                supporting_fact_ids=resolved_parent_fact_ids,
                             )
-                        elif matching_obj and current_iter_num > 1 and latest_assessment:
-                            node_queries = self.followup_generator.generate_followup_queries(
+                        except TypeError:
+                            try:
+                                node_queries = self.query_generator.generate_queries(
+                                    objective=matching_obj,
+                                    prospect=prospect,
+                                    existing_queries=accumulator.search_queries_used,
+                                )
+                            except Exception as qg_err2:
+                                logger.debug("Query generator error: %s", qg_err2)
+                                node_queries = []
+                        except Exception as qg_err:
+                            logger.debug("Query generator error: %s", qg_err)
+                            node_queries = []
+
+                    if not node_queries and self.followup_generator and latest_assessment:
+                        try:
+                            fu_output = self.followup_generator.generate_followup_queries(
                                 prospect=prospect,
                                 assessment=latest_assessment,
                                 existing_queries=accumulator.search_queries_used,
-                                max_queries=2,
+                                max_queries=3,
                             )
-
-                        if not node_queries:
-                            all_dirs = node.supporting_search_directions + node.disconfirming_search_directions
-                            for dir_text in all_dirs:
-                                if dir_text and dir_text not in accumulator.search_queries_used:
+                            fu_list = getattr(fu_output, "queries", fu_output) if fu_output else []
+                            for q_item in fu_list:
+                                q_text = q_item if isinstance(q_item, str) else getattr(q_item, "query_text", str(q_item))
+                                if q_text and q_text not in accumulator.search_queries_used:
                                     node_queries.append(
                                         GeneratedQuery(
                                             query_id=str(uuid.uuid4()),
-                                            objective_id=matching_obj.objective_id if matching_obj else None,
-                                            query_text=dir_text,
+                                            objective_id=matching_obj.objective_id if matching_obj else node.question_id,
+                                            query_text=q_text,
                                             target_entity=matching_obj.target_entity if matching_obj else TargetEntity.COMPANY,
-                                            rationale=f"Search direction for question {node.question_id}",
+                                            rationale="Sufficiency follow-up search direction",
+                                            parent_question_id=primary_parent_id,
                                         )
                                     )
-                        queries_by_node[node.question_id] = node_queries
-                        queries.extend(node_queries)
-                elif current_iter_num > 1:
-                    if latest_assessment:
-                        queries = self.followup_generator.generate_followup_queries(
-                            prospect=prospect,
-                            assessment=latest_assessment,
-                            existing_queries=accumulator.search_queries_used,
-                            max_queries=4,
-                        )
-                    if not queries:
-                        logger.info("DAG Scheduler: 0 questions ready and no follow-up queries in turn %d; halting iterations.", current_iter_num)
-                        is_complete = True
-                        break
+                        except Exception as fu_err:
+                            logger.debug("Followup query generator error: %s", fu_err)
+
+                    if not node_queries:
+                        all_dirs = node.supporting_search_directions + node.disconfirming_search_directions
+                        for dir_text in all_dirs:
+                            if dir_text and dir_text not in accumulator.search_queries_used:
+                                query_text = dir_text
+                                if contextual_entities:
+                                    primary_entity = contextual_entities[0]
+                                    if "{entity}" in query_text:
+                                        query_text = query_text.replace("{entity}", primary_entity)
+                                    elif primary_entity.lower() not in query_text.lower():
+                                        query_text = f"{query_text} {primary_entity}"
+                                if len(query_text) > 120:
+                                    query_text = query_text[:120].rsplit(" ", 1)[0].strip()
+
+                                node_queries.append(
+                                    GeneratedQuery(
+                                        query_id=str(uuid.uuid4()),
+                                        objective_id=matching_obj.objective_id if matching_obj else None,
+                                        query_text=query_text,
+                                        target_entity=matching_obj.target_entity if matching_obj else TargetEntity.COMPANY,
+                                        rationale=f"Search direction for question {node.question_id}",
+                                        parent_question_id=primary_parent_id,
+                                        supporting_fact_ids=resolved_parent_fact_ids,
+                                    )
+                                )
+                    queries_by_node[node.question_id] = node_queries
+                    queries.extend(node_queries)
+
+                if not queries:
+                    logger.info("DAG Scheduler: No queries generated for ready questions in turn %d; halting iterations.", current_iter_num)
+                    dag_terminal_reason = dag_terminal_reason or "No queries generated for ready questions"
+                    is_complete = True
+                    break
 
                 # Persist queries
                 valid_obj_ids = {obj.objective_id for obj in objectives}
@@ -278,14 +365,20 @@ class Researcher:
 
                 # Step B0: Local Historical Lexical Retrieval (Zero budget consumption, project-scoped)
                 historical_snap_ids: List[str] = []
+                satisfied_query_ids: Set[str] = set()
                 if self.retrieval_service is not None:
+                    retrieval_scope = RetrievalScope(
+                        project_id=effective_project_id,
+                        company_domain=effective_company_domain,
+                    )
                     for q in queries:
                         try:
                             ret_resp = self.retrieval_service.search(
                                 query=q.query_text,
-                                scope=RetrievalScope(project_id=prospect_id),
+                                scope=retrieval_scope,
                                 limit=max_results_per_query,
                             )
+                            found_relevant = False
                             for item in ret_resp.items:
                                 if item.record_type == RetrievedRecordType.SOURCE_SNAPSHOT:
                                     item_url = item.url or f"urn:snapshot:{item.record_id}"
@@ -309,13 +402,18 @@ class Researcher:
                                         accumulator.add_source(hist_source)
                                         if item.record_id not in historical_snap_ids:
                                             historical_snap_ids.append(item.record_id)
+                                    if item.raw_text and len(item.raw_text.strip()) > 80:
+                                        found_relevant = True
+                            if found_relevant:
+                                satisfied_query_ids.add(q.query_id)
                         except Exception as ret_err:
                             logger.warning("Historical retrieval error for query '%s': %s", q.query_text, ret_err)
 
-                # Step B: Search Execution & Page Fetching
-                new_snapshot_ids = self._execute_searches_and_fetches(
+                # Step B: Search Execution & Page Fetching (Skip queries satisfied by historical retrieval)
+                queries_to_search = [q for q in queries if q.query_id not in satisfied_query_ids]
+                new_snapshot_ids, active_budget = self._execute_searches_and_fetches(
                     session_id=active_session_id,
-                    queries=queries,
+                    queries=queries_to_search,
                     accumulator=accumulator,
                     max_results=max_results_per_query,
                     max_pages=max_pages_to_fetch_per_iter,
@@ -435,15 +533,17 @@ class Researcher:
                     current_iter_num += 1
 
                     # Reopen DAG nodes for objectives that require continued research
+                    # Only IN_PROGRESS, PARTIALLY_RESOLVED, and UNRESOLVED nodes may be reopened.
+                    # RESOLVED and UNOBSERVABLE nodes must never be reopened by sufficiency evaluation.
                     for obj_ass in assessment.objective_assessments:
                         if obj_ass.coverage_status != CoverageStatus.ADEQUATE:
                             n_id = f"qn_{obj_ass.objective_id.replace('-', '')[:10]}"
                             if n_id in dag.nodes:
                                 node = dag.get_node(n_id)
                                 if node.status in (
-                                    QuestionLifecycleStatus.RESOLVED,
                                     QuestionLifecycleStatus.IN_PROGRESS,
                                     QuestionLifecycleStatus.PARTIALLY_RESOLVED,
+                                    QuestionLifecycleStatus.UNRESOLVED,
                                 ):
                                     dag = dag.reopen_node(
                                         question_id=n_id,
@@ -456,9 +556,9 @@ class Researcher:
                             if n_id in dag.nodes:
                                 node = dag.get_node(n_id)
                                 if node.status in (
-                                    QuestionLifecycleStatus.RESOLVED,
                                     QuestionLifecycleStatus.IN_PROGRESS,
                                     QuestionLifecycleStatus.PARTIALLY_RESOLVED,
+                                    QuestionLifecycleStatus.UNRESOLVED,
                                 ):
                                     dag = dag.reopen_node(
                                         question_id=n_id,
@@ -489,13 +589,20 @@ class Researcher:
             if n["status"] in ("unresolved", "exhausted", "partially_resolved", "unobservable", "blocked")
         ]
 
+        if dag is not None and not dag_terminal_reason:
+            _, term_reason = EpistemicDAGScheduler.should_terminate_research(dag, budget=active_budget)
+            dag_terminal_reason = term_reason or "Iterations limit reached"
+
+        final_is_sufficient = is_sufficient or (dag.is_fully_resolved if dag else False)
         package = accumulator.to_package(
-            is_sufficient=is_sufficient,
+            is_sufficient=final_is_sufficient,
             is_complete=is_complete,
             missing_information=remaining_gaps,
             sufficiency_notes=explanation,
             question_dag_json=dag_json,
             unresolved_questions=unresolved_q_texts,
+            budget_state=active_budget,
+            dag_stop_reason=dag_terminal_reason,
         )
 
         # Update Session
@@ -503,7 +610,7 @@ class Researcher:
             uow.research.update_session(
                 session_id=active_session_id,
                 status="completed" if is_complete else "failed",
-                is_sufficient=is_sufficient,
+                is_sufficient=final_is_sufficient,
                 is_complete=is_complete,
                 completed_at=datetime.now(timezone.utc).isoformat(),
                 sufficiency_notes=explanation,
@@ -688,16 +795,16 @@ class Researcher:
         max_results: int,
         max_pages: int,
         budget: Optional[GlobalResearchBudget] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], GlobalResearchBudget]:
+        active_budget = budget or GlobalResearchBudget()
         raw_occurrences: List[Dict[str, Any]] = []
         self._last_search_had_failure = False
 
         for q in queries:
-            if budget and not budget.can_consume_baseline(1):
+            if not active_budget.can_consume_baseline(1):
                 logger.info("Search query '%s' skipped due to global budget exhaustion", q.query_text)
                 continue
-            if budget:
-                budget = budget.consume_baseline(1)
+            active_budget = active_budget.consume_baseline(1)
 
             start_t = time.time()
             resp: SearchResponse = self.search_client.search(query=q.query_text, max_results=max_results)
@@ -817,7 +924,7 @@ class Researcher:
                     for cluster in detection_res.clusters:
                         uow.sources.save_syndication_cluster(cluster)
 
-        return created_snapshot_ids
+        return created_snapshot_ids, active_budget
 
     def _run_entity_resolution(
         self,

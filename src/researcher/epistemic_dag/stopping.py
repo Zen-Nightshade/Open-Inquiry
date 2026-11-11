@@ -85,6 +85,10 @@ def fact_matches_predicate(node_predicate: Optional[str], fact: Any) -> bool:
         cat = fact.get("fact_category") or fact.get("category")
         if cat:
             cat_str = str(cat.value if hasattr(cat, "value") else cat).lower()
+            if ("deployment" in norm_node_p or "customer" in norm_node_p) and ("launch" in cat_str or "product" in cat_str):
+                return False
+            if ("deployment" in norm_node_p or "customer" in norm_node_p) and any(k in cat_str for k in ("achievement", "customer", "deployment", "case_study", "commercial")):
+                return True
             if "funding" in norm_node_p and "funding" in cat_str:
                 return True
             if ("hiring" in norm_node_p or "leadership" in norm_node_p or "employee" in norm_node_p) and ("hiring" in cat_str or "organization" in cat_str):
@@ -98,11 +102,19 @@ def fact_matches_predicate(node_predicate: Optional[str], fact: Any) -> bool:
                 return False
             if "technology" in norm_node_p and ("hiring" in cat_str or "organization" in cat_str or "funding" in cat_str):
                 return False
+            if "deployment" in norm_node_p or "customer" in norm_node_p:
+                return False
             return False
 
         claim_text = str(fact.get("claim_text", "")).lower()
         if not claim_text:
             return True
+        if ("deployment" in norm_node_p or "customer" in norm_node_p):
+            if any(w in claim_text for w in ("announced", "availability", "unveils", "launched", "introducing")) and not any(w in claim_text for w in ("deployed", "adopted", "using", "customer", "client", "case study", "contracts", "partnered")):
+                return False
+            if any(w in claim_text for w in ("deployed", "adopted", "using", "customer", "client", "case study", "contracts", "partnered")):
+                return True
+            return False
         if any(w in claim_text for w in ("funding", "raised", "series a", "series b", "seed round")) and ("hiring" in norm_node_p or "leadership" in norm_node_p or "headcount" in norm_node_p or "employee" in norm_node_p or "technology" in norm_node_p):
             return False
         if any(w in claim_text for w in ("hired", "recruited", "appointed", "vp", "chief", "joined as")) and ("funding" in norm_node_p or "headcount" in norm_node_p or "employee" in norm_node_p or "technology" in norm_node_p):
@@ -130,6 +142,10 @@ def fact_matches_predicate(node_predicate: Optional[str], fact: Any) -> bool:
     cat = getattr(fact, "fact_category", None)
     if cat:
         cat_val = str(cat.value if hasattr(cat, "value") else cat).lower()
+        if ("deployment" in norm_node_p or "customer" in norm_node_p) and ("launch" in cat_val or "product" in cat_val):
+            return False
+        if ("deployment" in norm_node_p or "customer" in norm_node_p) and any(k in cat_val for k in ("achievement", "customer", "deployment", "case_study", "commercial")):
+            return True
         if "funding" in norm_node_p and "funding" in cat_val:
             return True
         if ("hiring" in norm_node_p or "leadership" in norm_node_p or "employee" in norm_node_p) and ("hiring" in cat_val or "organization" in cat_val):
@@ -142,6 +158,8 @@ def fact_matches_predicate(node_predicate: Optional[str], fact: Any) -> bool:
         if ("employee" in norm_node_p or "hiring" in norm_node_p or "leadership" in norm_node_p) and "funding" in cat_val:
             return False
         if "technology" in norm_node_p and ("hiring" in cat_val or "organization" in cat_val or "funding" in cat_val):
+            return False
+        if "deployment" in norm_node_p or "customer" in norm_node_p:
             return False
 
     fact_p = getattr(fact, "predicate", None) or getattr(fact, "requested_predicate", None)
@@ -156,6 +174,12 @@ def fact_matches_predicate(node_predicate: Optional[str], fact: Any) -> bool:
     claim_text = getattr(fact, "claim_text", "")
     if claim_text:
         claim_lower = claim_text.lower()
+        if ("deployment" in norm_node_p or "customer" in norm_node_p):
+            if any(w in claim_lower for w in ("announced", "availability", "unveils", "launched", "introducing")) and not any(w in claim_lower for w in ("deployed", "adopted", "using", "customer", "client", "case study", "contracts", "partnered")):
+                return False
+            if any(w in claim_lower for w in ("deployed", "adopted", "using", "customer", "client", "case study", "contracts", "partnered")):
+                return True
+            return False
         if any(w in claim_lower for w in ("funding", "raised", "series a", "series b", "seed round")) and ("hiring" in norm_node_p or "leadership" in norm_node_p or "headcount" in norm_node_p or "employee" in norm_node_p or "technology" in norm_node_p):
             return False
         if any(w in claim_lower for w in ("hired", "recruited", "appointed", "vp", "chief", "joined as")) and ("funding" in norm_node_p or "headcount" in norm_node_p or "employee" in norm_node_p or "technology" in norm_node_p):

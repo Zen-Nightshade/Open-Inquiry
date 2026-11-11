@@ -326,6 +326,13 @@ class EpistemicQuestionDAG(BaseModel):
         """Return all nodes currently in BLOCKED status."""
         return [node for node in self.nodes.values() if node.status == QuestionLifecycleStatus.BLOCKED]
 
+    @property
+    def is_fully_resolved(self) -> bool:
+        """Return True if all question nodes in the DAG are RESOLVED."""
+        return len(self.nodes) > 0 and all(
+            node.status == QuestionLifecycleStatus.RESOLVED for node in self.nodes.values()
+        )
+
     def transition_node(
         self,
         question_id: str,

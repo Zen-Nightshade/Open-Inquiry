@@ -263,6 +263,8 @@ class ResearchPackage(BaseModel):
     sufficiency_notes: Optional[str] = Field(default=None)
     question_dag_json: Optional[str] = Field(default=None, description="Serialized EpistemicQuestionDAG snapshot and summary")
     unresolved_questions: Tuple[str, ...] = Field(default=(), description="Neutral questions that remain uncorroborated, exhausted, or unobservable")
+    budget_state: Optional[Any] = Field(default=None, description="Final research budget state")
+    dag_stop_reason: Optional[str] = Field(default=None, description="Authoritative termination reason from DAG scheduler")
 
 
 @dataclass
@@ -446,6 +448,8 @@ class ResearchAccumulator:
         sufficiency_notes: Optional[str] = None,
         question_dag_json: Optional[str] = None,
         unresolved_questions: Optional[Sequence[str]] = None,
+        budget_state: Optional[Any] = None,
+        dag_stop_reason: Optional[str] = None,
     ) -> ResearchPackage:
         """Freeze mutable accumulator into immutable ResearchPackage contract."""
         return ResearchPackage(
@@ -460,4 +464,6 @@ class ResearchAccumulator:
             sufficiency_notes=sufficiency_notes,
             question_dag_json=question_dag_json,
             unresolved_questions=tuple(unresolved_questions or ()),
+            budget_state=budget_state,
+            dag_stop_reason=dag_stop_reason,
         )

@@ -33,6 +33,10 @@ class ObservabilityClassifier:
         "sec_filing",
         "acquisition_announcement",
         "product_launch",
+        "pricing",
+        "pricing_tier",
+        "pricing_tiers",
+        "pricing_model",
     }
 
     # Conditionally observable predicate tokens (observable via indirect sources, job boards, case studies)
@@ -149,7 +153,7 @@ class ObservabilityClassifier:
         is_public_predicate = any(p in norm_pred for p in cls.PUBLIC_PREDICATES)
         public_pattern_match = bool(
             re.search(
-                r"\b(publicly announced|press release|opened new office|expansion|funding round|sec filing|registered address|hiring|job posting|founded in)\b",
+                r"\b(publicly announced|press release|opened new office|expansion|funding round|sec filing|registered address|hiring|job posting|founded in|pricing|pricing tier|pricing tiers|pricing model)\b",
                 norm_q,
             )
         )

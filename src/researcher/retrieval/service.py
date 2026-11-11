@@ -118,7 +118,7 @@ class HistoricalRetrievalService:
                 rec_id = row["record_id"] if isinstance(row, sqlite3.Row) else row[1]
                 src_id = row["source_id"] if isinstance(row, sqlite3.Row) else row[2]
                 sess_id = row["session_id"] if isinstance(row, sqlite3.Row) else row[3]
-                run_id = row["run_id"] if isinstance(row, sqlite3.Row) else row[4]
+                src_run_id = row["source_run_id"] if isinstance(row, sqlite3.Row) else row[4]
                 proj_id = row["project_id"] if isinstance(row, sqlite3.Row) else row[5]
                 title = row["title"] if isinstance(row, sqlite3.Row) else row[6]
                 snippet = row["snippet"] if isinstance(row, sqlite3.Row) else row[7]
@@ -133,13 +133,21 @@ class HistoricalRetrievalService:
                     if rec_type_str == "source_snapshot"
                     else RetrievedRecordType.EVIDENCE_RECORD
                 )
-                # Preserve raw BM25 score without pretending abs() is a normalized probability
                 score = bm25_val
+                target_run_filter = scope.source_run_id if scope else None
+                if not target_run_filter and scope and scope.run_id and not scope.project_id and not scope.company_domain and not scope.prospect_id:
+                    target_run_filter = scope.run_id
+
+                effective_src_run_id = target_run_filter or src_run_id
+                effective_run_id = target_run_filter or src_run_id
+                ret_run_id = scope.run_id if scope else None
 
                 provenance = {
                     "source_id": src_id,
                     "session_id": sess_id,
-                    "run_id": run_id,
+                    "source_run_id": effective_src_run_id,
+                    "retrieval_run_id": ret_run_id,
+                    "run_id": effective_run_id,
                     "project_id": proj_id,
                     "captured_at": captured_at,
                     "url": url,
@@ -152,7 +160,9 @@ class HistoricalRetrievalService:
                         record_id=rec_id,
                         source_id=src_id,
                         session_id=sess_id,
-                        run_id=run_id,
+                        run_id=effective_run_id,
+                        source_run_id=effective_src_run_id,
+                        retrieval_run_id=ret_run_id,
                         project_id=proj_id,
                         title=title,
                         snippet=snippet or "",
@@ -181,21 +191,17 @@ class HistoricalRetrievalService:
         scope: RetrievalScope,
     ) -> Tuple[str, str, List[Any], List[Any]]:
         """Construct the SQL subquery for source snapshots with explicit run attribution."""
-        select_params: List[Any] = []
-        if scope.run_id:
-            run_col = "? AS run_id"
-            select_params.append(scope.run_id)
-        else:
-            run_col = "NULL AS run_id"
-
-        sql = f"""
+        sql = """
         SELECT
             'source_snapshot' AS record_type,
             s.snapshot_id AS record_id,
             s.source_id,
             s.session_id,
-            {run_col},
-            rs.prospect_id AS project_id,
+            (CASE WHEN (SELECT COUNT(DISTINCT ar2.run_id) FROM application_runs ar2 WHERE ar2.research_session_id = rs.session_id) = 1
+                  THEN (SELECT ar.run_id FROM application_runs ar WHERE ar.research_session_id = rs.session_id LIMIT 1)
+                  ELSE NULL
+             END) AS source_run_id,
+            COALESCE(rs.prospect_id, rs.context_id) AS project_id,
             s.title,
             snippet(source_snapshots_fts, -1, '[[MATCH]]', '[[/MATCH]]', '...', 15) AS snippet,
             s.raw_text,
@@ -208,6 +214,7 @@ class HistoricalRetrievalService:
         JOIN source_snapshots s ON s.rowid = fts.rowid
         LEFT JOIN sources src ON src.source_id = s.source_id
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
+        LEFT JOIN prospects p ON p.prospect_id = rs.prospect_id
         WHERE source_snapshots_fts MATCH ?
         """
         count_sql = """
@@ -216,9 +223,10 @@ class HistoricalRetrievalService:
         JOIN source_snapshots s ON s.rowid = fts.rowid
         LEFT JOIN sources src ON src.source_id = s.source_id
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
+        LEFT JOIN prospects p ON p.prospect_id = rs.prospect_id
         WHERE source_snapshots_fts MATCH ?
         """
-        params: List[Any] = select_params + [sanitized_query]
+        params: List[Any] = [sanitized_query]
         count_params: List[Any] = [sanitized_query]
 
         filter_clauses, filter_params = self._build_scope_filters(scope)
@@ -237,21 +245,17 @@ class HistoricalRetrievalService:
         scope: RetrievalScope,
     ) -> Tuple[str, str, List[Any], List[Any]]:
         """Construct the SQL subquery for evidence passages with explicit run attribution."""
-        select_params: List[Any] = []
-        if scope.run_id:
-            run_col = "? AS run_id"
-            select_params.append(scope.run_id)
-        else:
-            run_col = "NULL AS run_id"
-
-        sql = f"""
+        sql = """
         SELECT
             'evidence_record' AS record_type,
             ep.evidence_id AS record_id,
             ep.source_id,
             s.session_id,
-            {run_col},
-            rs.prospect_id AS project_id,
+            (CASE WHEN (SELECT COUNT(DISTINCT ar2.run_id) FROM application_runs ar2 WHERE ar2.research_session_id = rs.session_id) = 1
+                  THEN (SELECT ar.run_id FROM application_runs ar WHERE ar.research_session_id = rs.session_id LIMIT 1)
+                  ELSE NULL
+             END) AS source_run_id,
+            COALESCE(rs.prospect_id, rs.context_id) AS project_id,
             s.title,
             snippet(evidence_passages_fts, 0, '[[MATCH]]', '[[/MATCH]]', '...', 15) AS snippet,
             ep.verbatim_excerpt AS raw_text,
@@ -265,6 +269,7 @@ class HistoricalRetrievalService:
         LEFT JOIN source_snapshots s ON s.snapshot_id = ep.snapshot_id
         LEFT JOIN sources src ON src.source_id = ep.source_id
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
+        LEFT JOIN prospects p ON p.prospect_id = rs.prospect_id
         WHERE evidence_passages_fts MATCH ?
         """
         count_sql = """
@@ -274,9 +279,10 @@ class HistoricalRetrievalService:
         LEFT JOIN source_snapshots s ON s.snapshot_id = ep.snapshot_id
         LEFT JOIN sources src ON src.source_id = ep.source_id
         LEFT JOIN research_sessions rs ON rs.session_id = s.session_id
+        LEFT JOIN prospects p ON p.prospect_id = rs.prospect_id
         WHERE evidence_passages_fts MATCH ?
         """
-        params: List[Any] = select_params + [sanitized_query]
+        params: List[Any] = [sanitized_query]
         count_params: List[Any] = [sanitized_query]
 
         filter_clauses, filter_params = self._build_scope_filters(scope)
@@ -298,17 +304,41 @@ class HistoricalRetrievalService:
             clauses.append("s.session_id = ?")
             params.append(scope.session_id)
 
-        target_project = scope.project_id or scope.prospect_id
-        if target_project:
-            clauses.append("(rs.prospect_id = ? OR rs.context_id = ?)")
-            params.append(target_project)
-            params.append(target_project)
+        # 1. Project boundary
+        if scope.project_id:
+            clauses.append("(rs.context_id = ? OR rs.context_id LIKE ? OR rs.prospect_id = ?)")
+            params.append(scope.project_id)
+            params.append(f"{scope.project_id}:%")
+            params.append(scope.project_id)
+        elif not scope.prospect_id and not scope.run_id and not scope.session_id and scope.company_domain:
+            # Fail closed: If company_domain is queried without project_id, prospect_id, run_id, or session_id,
+            # we cannot guarantee project isolation. Fail closed to prevent cross-project leakage.
+            clauses.append("1 = 0")
 
-        if scope.run_id:
+        # 2. Company domain boundary
+        if scope.company_domain:
+            norm_dom = scope.company_domain.lower().strip()
+            clauses.append("(LOWER(p.company_domain) = ? OR LOWER(src.domain) = ? OR LOWER(src.canonical_url) LIKE ?)")
+            params.append(norm_dom)
+            params.append(norm_dom)
+            params.append(f"%{norm_dom}%")
+
+        # 3. Individual prospect boundary
+        if scope.prospect_id:
+            clauses.append("rs.prospect_id = ?")
+            params.append(scope.prospect_id)
+
+        # 4. Run boundary
+        target_run_filter = scope.source_run_id
+        if not target_run_filter and scope.run_id and not scope.project_id and not scope.company_domain and not scope.prospect_id:
+            # If run_id is supplied without broader scoping (e.g. historical run lookup), treat as source filter
+            target_run_filter = scope.run_id
+
+        if target_run_filter:
             clauses.append(
                 "s.session_id IN (SELECT research_session_id FROM application_runs WHERE run_id = ?)"
             )
-            params.append(scope.run_id)
+            params.append(target_run_filter)
 
         if scope.domain:
             clauses.append("src.domain = ?")

@@ -17,6 +17,7 @@ from src.researcher.evidence_request.models import EvidenceFeedbackBudget, Feedb
 from src.researcher.evidence_request.executor import EvidenceRequestExecutor
 from src.researcher.models import ResearchAccumulator, ResearchPackage, ResolutionStatus
 from src.researcher.orchestration.orchestrator import Researcher
+from src.researcher.retrieval import HistoricalRetrievalService
 from src.signal_strategy.evidence_requests import EvidenceGapDetector
 from src.signal_strategy.models import StrategyResult
 from src.signal_strategy.service import SignalStrategyService
@@ -58,9 +59,19 @@ class ApplicationOrchestrator:
         researcher: Optional[Researcher] = None,
         strategy_service: Optional[SignalStrategyService] = None,
         email_service: Optional[EmailGenerationService] = None,
+        retrieval_service: Optional[HistoricalRetrievalService] = None,
     ) -> None:
         self.state_store = state_store
-        self.researcher = researcher or Researcher(state_store=self.state_store)
+        self.retrieval_service = retrieval_service or HistoricalRetrievalService(state_store=self.state_store)
+        self.researcher = researcher or Researcher(
+            state_store=self.state_store,
+            retrieval_service=self.retrieval_service,
+        )
+        if getattr(self.researcher, "retrieval_service", None) is None:
+            try:
+                self.researcher.retrieval_service = self.retrieval_service
+            except Exception:
+                pass
         self.strategy_service = strategy_service or SignalStrategyService()
         self.email_service = email_service or EmailGenerationService(state_store=self.state_store)
 
@@ -73,6 +84,7 @@ class ApplicationOrchestrator:
         max_research_iterations: int = 3,
         allow_insufficient_research: bool = False,
         total_research_budget: int = 20,
+        project_id: Optional[str] = None,
     ) -> RunResult:
         """Execute the full end-to-end outreach pipeline with stage-level persistence."""
         # Ensure database is initialized and schema is valid before executing pipeline
@@ -92,7 +104,7 @@ class ApplicationOrchestrator:
         if existing_run:
             job_id = existing_run.get("job_id") or f"job_{uuid.uuid4().hex}"
             session_id = existing_run.get("research_session_id") or f"session_{uuid.uuid4().hex}"
-            context_id = existing_run.get("context_id") or str(uuid.uuid4())
+            context_id = existing_run.get("context_id") or project_id or str(uuid.uuid4())
             prospect_id = existing_run["prospect_id"]
             if existing_run.get("stage_statuses_json"):
                 try:
@@ -105,7 +117,7 @@ class ApplicationOrchestrator:
         else:
             job_id = f"job_{uuid.uuid4().hex}"
             session_id = f"session_{uuid.uuid4().hex}"
-            context_id = str(uuid.uuid4())
+            context_id = project_id or str(uuid.uuid4())
             stage_records = []
 
         # Propagate observability context variables
@@ -276,7 +288,12 @@ class ApplicationOrchestrator:
                 context_id=context_id,
                 max_iterations=max_research_iterations,
                 budget=global_budget,
+                project_id=project_id or context_id,
+                run_id=active_run_id,
             )
+
+            if research_package.budget_state is not None and isinstance(research_package.budget_state, GlobalResearchBudget):
+                global_budget = research_package.budget_state
 
             record_stage(
                 stage=StageIdentifier.RESEARCH,
@@ -287,8 +304,11 @@ class ApplicationOrchestrator:
                     "sources_count": len(research_package.sources),
                     "is_sufficient": research_package.is_sufficient,
                     "is_complete": research_package.is_complete,
+                    "budget_initial": global_budget.total_budget_units,
                     "budget_consumed": global_budget.total_units_consumed,
                     "budget_remaining": global_budget.remaining_total_units,
+                    "baseline_consumed": global_budget.baseline_units_consumed,
+                    "feedback_consumed": global_budget.feedback_units_consumed,
                 },
             )
 
@@ -471,124 +491,151 @@ class ApplicationOrchestrator:
                 strategy_result.strategy and getattr(strategy_result.strategy, "is_conditional", False)
             )):
                 s_feedback_start = datetime.now(timezone.utc).isoformat()
-                gap_detector = EvidenceGapDetector(max_requests=3)
-                evidence_requests = gap_detector.detect_gaps_and_create_requests(
-                    strategy_result=strategy_result,
-                    research_package=research_package,
-                    prospect=prospect,
-                    product=product,
-                    run_id=active_run_id,
-                )
-
-                if evidence_requests:
-                    logger.info(
-                        "Executing bounded evidence feedback round for run %s with %d requests",
-                        active_run_id,
-                        len(evidence_requests),
+                if global_budget.is_exhausted or global_budget.is_feedback_exhausted:
+                    logger.info("Skipping feedback round: global budget or feedback limit exhausted")
+                    record_stage(
+                        stage=StageIdentifier.RESEARCH_FEEDBACK,
+                        status=StageStatus.SKIPPED,
+                        started_at=s_feedback_start,
+                        details={
+                            "reason": "Global budget or feedback sub-limit exhausted",
+                            "budget_consumed": global_budget.total_units_consumed,
+                            "remaining": global_budget.remaining_total_units,
+                        },
                     )
-                    feedback_budget = EvidenceFeedbackBudget(
-                        baseline_budget_units=global_budget.total_budget_units,
-                        max_feedback_budget_ratio=global_budget.max_feedback_budget_ratio,
-                        feedback_budget_cap=global_budget.feedback_budget_cap,
-                        feedback_units_consumed=global_budget.feedback_units_consumed,
-                        rounds_executed=global_budget.feedback_rounds_executed,
-                        requests_executed_count=global_budget.feedback_requests_executed,
-                    )
-                    executor = EvidenceRequestExecutor(researcher=self.researcher, state_store=self.state_store)
-
-                    acc = (
-                        self.researcher._hydrate_accumulator(session_id)
-                        if hasattr(self.researcher, "_hydrate_accumulator")
-                        else ResearchAccumulator(facts=list(research_package.facts), sources=list(research_package.sources))
-                    )
-
-                    feedback_round_result = executor.execute_requests(
-                        requests=evidence_requests,
-                        session_id=session_id,
-                        run_id=active_run_id,
-                        budget=feedback_budget,
-                        accumulator=acc,
-                        round_number=1,
-                    )
-
-                    delta_feedback = feedback_round_result.budget.feedback_units_consumed - global_budget.feedback_units_consumed
-                    if delta_feedback > 0:
-                        global_budget = global_budget.consume_feedback(
-                            cost_units=delta_feedback,
-                            increment_request=False,
-                        )
-                    global_budget = global_budget.complete_feedback_round()
-
-                    # Update research package facts from rehydrated accumulator
-                    if hasattr(self.researcher, "_hydrate_accumulator"):
-                        updated_acc = self.researcher._hydrate_accumulator(session_id)
-                    else:
-                        updated_acc = acc
-
-                    if research_package.question_dag_json:
-                        try:
-                            summary = json.loads(research_package.question_dag_json)
-                            summary.setdefault("feedback_requests", []).extend([
-                                {"request_id": r.request_id, "predicate": r.requested_predicate, "status": r.status.value}
-                                for r in feedback_round_result.requests
-                            ])
-                            summary["global_budget_consumed"] = global_budget.total_units_consumed
-                            summary["global_budget_remaining"] = global_budget.remaining_total_units
-                            research_package = research_package.model_copy(
-                                update={
-                                    "facts": list(updated_acc.facts),
-                                    "sources": list(updated_acc.sources),
-                                    "question_dag_json": json.dumps(summary),
-                                }
-                            )
-                        except Exception:
-                            research_package = research_package.model_copy(
-                                update={
-                                    "facts": list(updated_acc.facts),
-                                    "sources": list(updated_acc.sources),
-                                }
-                            )
-                    else:
-                        research_package = research_package.model_copy(
-                            update={
-                                "facts": list(updated_acc.facts),
-                                "sources": list(updated_acc.sources),
-                            }
-                        )
-
-                    # Re-evaluate strategy with updated research package
-                    re_evaluated_strategy = self.strategy_service.develop_strategy(
+                else:
+                    gap_detector = EvidenceGapDetector(max_requests=3)
+                    evidence_requests = gap_detector.detect_gaps_and_create_requests(
+                        strategy_result=strategy_result,
                         research_package=research_package,
                         prospect=prospect,
                         product=product,
-                        outreach=outreach,
+                        run_id=active_run_id,
                     )
 
-                    if re_evaluated_strategy.is_viable and not (
-                        re_evaluated_strategy.strategy and getattr(re_evaluated_strategy.strategy, "is_conditional", False)
-                    ):
-                        logger.info("Feedback research successfully resolved evidence gaps; strategy is now VIABLE.")
-                        strategy_result = re_evaluated_strategy
-                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
-                    elif re_evaluated_strategy.is_viable:
-                        strategy_result = re_evaluated_strategy
-                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
+                    if not evidence_requests:
+                        logger.info("No actionable evidence gaps detected; skipping feedback research")
+                        record_stage(
+                            stage=StageIdentifier.RESEARCH_FEEDBACK,
+                            status=StageStatus.SKIPPED,
+                            started_at=s_feedback_start,
+                            details={
+                                "reason": "No evidence gaps detected",
+                                "global_budget_consumed": global_budget.total_units_consumed,
+                                "global_budget_remaining": global_budget.remaining_total_units,
+                            },
+                        )
                     else:
-                        logger.info("Strategy remains unviable after feedback research.")
-                        feedback_round_result = feedback_round_result.model_copy(update={"strategy_invalidated": True})
+                        logger.info(
+                            "Executing bounded evidence feedback round for run %s with %d requests",
+                            active_run_id,
+                            len(evidence_requests),
+                        )
+                        feedback_budget = EvidenceFeedbackBudget(
+                            baseline_budget_units=global_budget.total_budget_units,
+                            max_feedback_budget_ratio=global_budget.max_feedback_budget_ratio,
+                            feedback_budget_cap=global_budget.feedback_budget_cap,
+                            feedback_units_consumed=global_budget.feedback_units_consumed,
+                            rounds_executed=global_budget.feedback_rounds_executed,
+                            requests_executed_count=global_budget.feedback_requests_executed,
+                        )
+                        executor = EvidenceRequestExecutor(researcher=self.researcher, state_store=self.state_store)
 
-                    record_stage(
-                        stage=StageIdentifier.RESEARCH_FEEDBACK,
-                        status=StageStatus.COMPLETED,
-                        started_at=s_feedback_start,
-                        details={
-                            "requests_count": len(evidence_requests),
-                            "budget_consumed": feedback_round_result.budget.feedback_units_consumed,
-                            "budget_cap": feedback_round_result.budget.feedback_budget_cap,
-                            "strategy_became_viable": re_evaluated_strategy.is_viable,
-                            "status": feedback_round_result.status,
-                        },
-                    )
+                        acc = (
+                            self.researcher._hydrate_accumulator(session_id)
+                            if hasattr(self.researcher, "_hydrate_accumulator")
+                            else ResearchAccumulator(facts=list(research_package.facts), sources=list(research_package.sources))
+                        )
+
+                        feedback_round_result = executor.execute_requests(
+                            requests=evidence_requests,
+                            session_id=session_id,
+                            run_id=active_run_id,
+                            budget=feedback_budget,
+                            accumulator=acc,
+                            round_number=1,
+                        )
+
+                        delta_feedback = feedback_round_result.budget.feedback_units_consumed - global_budget.feedback_units_consumed
+                        if delta_feedback > 0:
+                            global_budget = global_budget.consume_feedback(
+                                cost_units=delta_feedback,
+                                increment_request=False,
+                            )
+                        global_budget = global_budget.complete_feedback_round()
+
+                        # Update research package facts from rehydrated accumulator
+                        if hasattr(self.researcher, "_hydrate_accumulator"):
+                            updated_acc = self.researcher._hydrate_accumulator(session_id)
+                        else:
+                            updated_acc = acc
+
+                        if research_package.question_dag_json:
+                            try:
+                                summary = json.loads(research_package.question_dag_json)
+                                summary.setdefault("feedback_requests", []).extend([
+                                    {"request_id": r.request_id, "predicate": r.requested_predicate, "status": r.status.value}
+                                    for r in feedback_round_result.requests
+                                ])
+                                summary["global_budget_consumed"] = global_budget.total_units_consumed
+                                summary["global_budget_remaining"] = global_budget.remaining_total_units
+                                research_package = research_package.model_copy(
+                                    update={
+                                        "facts": list(updated_acc.facts),
+                                        "sources": list(updated_acc.sources),
+                                        "question_dag_json": json.dumps(summary),
+                                    }
+                                )
+                            except Exception:
+                                research_package = research_package.model_copy(
+                                    update={
+                                        "facts": list(updated_acc.facts),
+                                        "sources": list(updated_acc.sources),
+                                    }
+                                )
+                        else:
+                            research_package = research_package.model_copy(
+                                update={
+                                    "facts": list(updated_acc.facts),
+                                    "sources": list(updated_acc.sources),
+                                }
+                            )
+
+                        # Re-evaluate strategy with updated research package
+                        re_evaluated_strategy = self.strategy_service.develop_strategy(
+                            research_package=research_package,
+                            prospect=prospect,
+                            product=product,
+                            outreach=outreach,
+                        )
+
+                        if re_evaluated_strategy.is_viable and not (
+                            re_evaluated_strategy.strategy and getattr(re_evaluated_strategy.strategy, "is_conditional", False)
+                        ):
+                            logger.info("Feedback research successfully resolved evidence gaps; strategy is now VIABLE.")
+                            strategy_result = re_evaluated_strategy
+                            feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
+                        elif re_evaluated_strategy.is_viable:
+                            strategy_result = re_evaluated_strategy
+                            feedback_round_result = feedback_round_result.model_copy(update={"strategy_revised": True})
+                        else:
+                            logger.info("Strategy remains unviable after feedback research.")
+                            feedback_round_result = feedback_round_result.model_copy(update={"strategy_invalidated": True})
+
+                        record_stage(
+                            stage=StageIdentifier.RESEARCH_FEEDBACK,
+                            status=StageStatus.COMPLETED,
+                            started_at=s_feedback_start,
+                            details={
+                                "requests_count": len(evidence_requests),
+                                "budget_consumed": feedback_round_result.budget.feedback_units_consumed,
+                                "budget_cap": feedback_round_result.budget.feedback_budget_cap,
+                                "global_budget_consumed": global_budget.total_units_consumed,
+                                "global_budget_remaining": global_budget.remaining_total_units,
+                                "strategy_became_viable": re_evaluated_strategy.is_viable,
+                                "status": feedback_round_result.status,
+                            },
+                        )
 
             # =========================================================================
             # Stage 6: Strategy Viability Check & Email Generation
